@@ -167,7 +167,12 @@ Optional knobs:
 - `OPENCODE_CLAUDE_RATE_LIMIT_FAST_FAIL` — `0` disables the 429 rate-limit gate
 - `OPENCODE_CLAUDE_RATE_LIMIT_STORE` — override the rate-limit store path (tests)
 - `OPENCODE_CLAUDE_HISTORY_MAX_CHARS` — budget for transferred conversation history when a Claude session cannot be resumed (default `400000`; newest messages are kept, `0` disables transfer)
-- `OPENCODE_CLAUDE_USAGE_LOG` — `0` disables `~/.local/share/opencode-claude/usage.jsonl`, one line per response with input / cache_read / cache_write / output tokens (OpenCode itself folds cache writes into input)
+- `OPENCODE_CLAUDE_USAGE_LOG` — `0` disables `~/.local/share/opencode-claude/usage.jsonl`, one line per response with input / cache_read / cache_write / output tokens, a 5m/1h cache-write split, an estimated `turn_cost_usd`, and the harness section sizes that produced the request (OpenCode itself folds cache writes into input). `cost_usd` on a line is the SDK's cumulative session figure, not the hop
+- `OPENCODE_CLAUDE_SPILL_CHARS` — tool results longer than this are written to a file and replaced with a path, size, and head/tail (default `8000`; `0` keeps the old history truncation and inlines live results)
+- `OPENCODE_CLAUDE_SPILL_DIR` — directory for spilled outputs (default `~/.local/share/opencode-claude/spills`)
+- `OPENCODE_CLAUDE_DYNAMIC_SECTIONS` — `keep` puts cwd, memory path, and git status back in the cached system prompt. Default moves them out of the prefix (`excludeDynamicSections`)
+- `OPENCODE_CLAUDE_PROMPT_V2` — `1` uses the shorter OpenCode system-prompt append (plain descriptions, stable todo sentence). Default is the historical append
+- `OPENCODE_CLAUDE_DEFER_TOOLS` — `1` leaves `webfetch`, `websearch`, and `subagent` out of the static tool list (tool search can still load them). Default loads every bridged tool
 
 ## Troubleshooting
 

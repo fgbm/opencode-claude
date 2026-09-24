@@ -147,6 +147,20 @@ async function main() {
     const handlers = servers.opencode.instance.server._requestHandlers;
     const listed = await handlers.get("tools/list")({ method: "tools/list", params: {} }, {});
     assert.deepEqual(listed.tools[0].inputSchema, parameters);
+    assert.deepEqual(listed.tools[0]._meta, { "anthropic/alwaysLoad": true });
+    process.env.OPENCODE_CLAUDE_DEFER_TOOLS = "1";
+    try {
+      const deferred: any = await buildOpenCodeMcpServer(
+        [{ type: "function", function: { name: "webfetch", description: "Fetch a URL\nmore", parameters } }] as any,
+        new Map(),
+        () => {},
+      );
+      const deferredList = await deferred.opencode.instance.server._requestHandlers
+        .get("tools/list")({ method: "tools/list", params: {} }, {});
+      assert.deepEqual(deferredList.tools[0]._meta, { "anthropic/searchHint": "Fetch a URL" });
+    } finally {
+      delete process.env.OPENCODE_CLAUDE_DEFER_TOOLS;
+    }
     await handlers.get("tools/call")(
       {
         method: "tools/call",
@@ -660,7 +674,7 @@ async function main() {
     // system prompt never leaks into the transfer
     assert.doesNotMatch(transcript, /huge internal system prompt/);
 
-    // tool calls/results are condensed but present
+    // tool calls are condensed; results under the spill threshold stay whole
     const withTools = buildConversationTranscript([
       { role: "user", content: "run tests" },
       {
@@ -674,7 +688,76 @@ async function main() {
     ]);
     assert.match(withTools, /\[called tool: bash\]/);
     assert.match(withTools, /Tool result/);
-    assert.match(withTools, /chars omitted/);
+    assert.match(withTools, /x{5000}/);
+    assert.doesNotMatch(withTools, /chars omitted/);
+
+    // reasoning items survive history transfer (resume is not available)
+    const withReasoning = buildConversationTranscript([
+      {
+        role: "assistant",
+        content: "done",
+        reasoning_content: "checked the failing assertion first",
+      },
+    ]);
+    assert.match(withReasoning, /\[reasoning\]/);
+    assert.match(withReasoning, /failing assertion/);
+
+    // spill replaces truncation: path, size, tail, and the middle is on disk
+    const { mkdtempSync, readFileSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const spillDir = mkdtempSync(join(tmpdir(), "opencode-claude-spill-"));
+    const prevSpillDir = process.env.OPENCODE_CLAUDE_SPILL_DIR;
+    const prevSpillChars = process.env.OPENCODE_CLAUDE_SPILL_CHARS;
+    process.env.OPENCODE_CLAUDE_SPILL_DIR = spillDir;
+    process.env.OPENCODE_CLAUDE_SPILL_CHARS = "1000";
+    try {
+      const middle = "MIDDLE-MARKER-NOT-INLINED";
+      const payload = `${"H".repeat(400)}${middle}${"m".repeat(1000)}${"T".repeat(2000)}`;
+      const spilled = buildConversationTranscript([
+        {
+          role: "tool",
+          name: "shell",
+          content: payload,
+        },
+      ]);
+      assert.match(spilled, /output spilled/);
+      assert.match(spilled, new RegExp(`size: ${payload.length}`));
+      assert.match(spilled, /path: /);
+      assert.doesNotMatch(spilled, /MIDDLE-MARKER-NOT-INLINED/);
+      assert.match(spilled, /T{20}/);
+      const pathMatch = spilled.match(/path: (\S+)/);
+      assert.ok(pathMatch, "spill path present");
+      assert.match(readFileSync(pathMatch![1], "utf8"), /MIDDLE-MARKER-NOT-INLINED/);
+    } finally {
+      if (prevSpillDir === undefined) delete process.env.OPENCODE_CLAUDE_SPILL_DIR;
+      else process.env.OPENCODE_CLAUDE_SPILL_DIR = prevSpillDir;
+      if (prevSpillChars === undefined) delete process.env.OPENCODE_CLAUDE_SPILL_CHARS;
+      else process.env.OPENCODE_CLAUDE_SPILL_CHARS = prevSpillChars;
+      rmSync(spillDir, { recursive: true, force: true });
+    }
+
+    const { openCodeSystemAppend } = await import("../src/prompt.ts");
+    const v1 = openCodeSystemAppend(["todowrite"], "v1");
+    const v2 = openCodeSystemAppend(["read"], "v2");
+    assert.match(v1, /ALWAYS write the plan/);
+    assert.doesNotMatch(v2, /ALWAYS/);
+    assert.match(v2, /When mcp__opencode__todowrite is available/);
+    assert.equal(
+      openCodeSystemAppend(["read"], "v2"),
+      openCodeSystemAppend(["todowrite", "read"], "v2"),
+    );
+
+    // spill disabled restores middle truncation
+    process.env.OPENCODE_CLAUDE_SPILL_CHARS = "0";
+    try {
+      const truncated = buildConversationTranscript([
+        { role: "tool", tool_call_id: "c1", content: "x".repeat(5000) },
+      ]);
+      assert.match(truncated, /chars omitted/);
+    } finally {
+      delete process.env.OPENCODE_CLAUDE_SPILL_CHARS;
+    }
 
     // budget keeps the NEWEST messages, drops oldest first
     const tight = buildConversationTranscript(
@@ -774,6 +857,7 @@ async function main() {
     addOpenAIUsage,
     addUniqueAssistantUsage,
     resolveTurnUsage,
+    estimateTurnCostUsd,
   } = await import("../src/usage.ts");
   const callUsage = usageFromAssistantEvent({
     type: "assistant",
@@ -795,6 +879,30 @@ async function main() {
     usageFromAssistantEvent({ type: "result", usage: { input_tokens: 1 } }),
     null,
   );
+
+  // 1-hour cache writes are priced at 2× input. This fixture is the
+  // 2026-09-24 ses_f2c0b88e9ffecvOKNV3aju3xUL cost-state total; the SDK
+  // reported $0.7901388 for the same counts on claude-opus-5-5.
+  const priced = usageFromAssistantEvent({
+    type: "assistant",
+    message: {
+      usage: {
+        input_tokens: 26,
+        output_tokens: 8633,
+        cache_read_input_tokens: 520754,
+        cache_creation_input_tokens: 64153,
+        cache_creation: {
+          ephemeral_1h_input_tokens: 64153,
+          ephemeral_5m_input_tokens: 0,
+        },
+      },
+    },
+  });
+  assert.equal(priced?.cache_write_1h_tokens, 64153);
+  assert.equal(priced?.cache_write_5m_tokens, undefined);
+  assert.equal(estimateTurnCostUsd("opus", priced), 0.7901388);
+  assert.equal(estimateTurnCostUsd("claude-opus-5-5", priced), 0.7901388);
+  assert.equal(estimateTurnCostUsd("unknown-model", priced), null);
 
   const summed = addOpenAIUsage(callUsage, {
     prompt_tokens: 10,
@@ -1322,6 +1430,14 @@ async function main() {
                 parameters: { type: "object", properties: {} },
               },
             },
+            {
+              type: "function",
+              function: {
+                name: "question",
+                description: "Ask the user",
+                parameters: { type: "object", properties: {} },
+              },
+            },
           ],
           messages: [{ role: "user", content: "plan something" }],
         }),
@@ -1348,9 +1464,35 @@ async function main() {
         .toolAliases;
       assert.equal(aliases?.TodoWrite, "mcp__opencode__todowrite");
       assert.equal(aliases?.todowrite, "mcp__opencode__todowrite");
-      const sysPrompt = seenParams.systemPrompt as { append?: string };
+      const sysPrompt = seenParams.systemPrompt as {
+        append?: string;
+        snapshot?: boolean;
+        excludeDynamicSections?: boolean;
+      };
       assert.match(sysPrompt.append ?? "", /mcp__opencode__todowrite/);
       assert.match(sysPrompt.append ?? "", /[Bb]atch independent tool calls/);
+      assert.equal(sysPrompt.snapshot, true);
+      assert.equal(sysPrompt.excludeDynamicSections, true);
+
+      // Bridged tools register in a stable order for the cached prefix.
+      const registeredTools = (
+        seenParams as {
+          mcpServers?: {
+            opencode?: {
+              instance?: {
+                _registeredTools?: Record<string, { inputSchema?: unknown }>;
+              };
+            };
+          };
+        }
+      ).mcpServers?.opencode?.instance?._registeredTools;
+      const registeredNames = Object.keys(registeredTools ?? {});
+      assert.deepEqual(
+        registeredNames,
+        [...registeredNames].sort(),
+        "bridged tools are registered in a stable name order",
+      );
+      assert.deepEqual(registeredNames, ["question", "todowrite"]);
 
       // Proxy + mock SDK: a tool-call API message ends with `message_delta`
       // AFTER the tool call parks the turn. That event must survive the park
