@@ -4,6 +4,14 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { mkdtempSync as mkdtempSyncTop, rmSync as rmSyncTop } from "node:fs";
+import { tmpdir as tmpdirTop } from "node:os";
+import { join as joinTop } from "node:path";
+
+// Mock turns must not touch the operator's real plugin data: debug.log,
+// usage.jsonl, rate-limit.json and sessions.json all live under XDG_DATA_HOME.
+const testDataHome = mkdtempSyncTop(joinTop(tmpdirTop(), "opencode-claude-smoke-"));
+process.env.XDG_DATA_HOME = testDataHome;
 
 async function main() {
   // Mock turns must not append to the operator's real usage log.
@@ -970,8 +978,9 @@ async function main() {
     const { spawnSync } = await import("node:child_process");
     const { readFileSync, unlinkSync, existsSync } = await import("node:fs");
     const { join } = await import("node:path");
-    const { homedir } = await import("node:os");
-    const logPath = join(homedir(), ".local", "share", "opencode-claude", "debug.log");
+    // Resolved like src/log.ts; XDG_DATA_HOME points at the per-run test dir,
+    // so deleting it never touches the operator's real debug.log.
+    const logPath = join(process.env.XDG_DATA_HOME!, "opencode-claude", "debug.log");
     if (existsSync(logPath)) unlinkSync(logPath);
 
     const off = spawnSync(
@@ -2335,7 +2344,10 @@ async function main() {
   console.log("ok — opencode-claude smoke tests passed");
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+main()
+  .then(() => rmSyncTop(testDataHome, { recursive: true, force: true }))
+  .catch((err) => {
+    console.error(err);
+    console.error(`test data kept for inspection: ${testDataHome}`);
+    process.exit(1);
+  });
