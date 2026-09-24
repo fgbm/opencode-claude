@@ -563,6 +563,10 @@ async function handleChatCompletions(
   let handle: ClaudeQueryHandle | null = null;
   let parked = false;
   let parkWaiters: Array<() => void> = [];
+  // iterator.next() still in flight when a park wins the race. Its event
+  // (typically the tool-call message's final `message_delta` usage) belongs
+  // to the continuation; issuing a fresh next() would drop it.
+  let carriedNext: Promise<IteratorResult<unknown>> | null = null;
 
   const notifyPark = () => {
     parked = true;
@@ -807,7 +811,8 @@ async function handleChatCompletions(
     conversationKey,
     handle,
     pendingTools,
-    seenAssistantUsageIds: new Set(),
+    reportedUsage: new Map(),
+    usageState: { messageId: null },
     createdAt: Date.now(),
   };
   putBridge(bridge);
@@ -851,7 +856,8 @@ async function handleChatCompletions(
           stallTimer.unref?.();
         });
 
-        const nextPromise = iterator.next();
+        const nextPromise = carriedNext ?? iterator.next();
+        carriedNext = null;
         let raced:
           | { kind: "event"; value: IteratorResult<unknown> }
           | { kind: "park" };
@@ -876,6 +882,14 @@ async function handleChatCompletions(
 
         if (raced.kind === "park" || (parked && pendingTools.size > 0)) {
           parkControl.cancel?.();
+          if (raced.kind === "park") {
+            carriedNext = nextPromise;
+            // The bridge may be closed before any continuation reads it.
+            nextPromise.then(
+              () => {},
+              () => {},
+            );
+          }
           await Promise.resolve();
           // The iterator's pending next() may already have consumed the
           // assistant event that carries the parked tool call (and its
@@ -1117,8 +1131,8 @@ async function collectTurnResponse(
 
   let content = "";
   let reasoning = "";
-  const usageTracker = new TurnUsageTracker(bridge.seenAssistantUsageIds);
-  const mapState: MapState = { messageId: null };
+  const usageTracker = new TurnUsageTracker(bridge.reportedUsage);
+  const mapState: MapState = bridge.usageState;
   let resultUsage: OpenAIUsage | null = null;
   let lastErrorNorm: string | null = null;
   let errorText: string | null = null;
@@ -1446,8 +1460,8 @@ function streamOpenAIResponse(
       });
 
       let finishReason: string | null = "stop";
-      const usageTracker = new TurnUsageTracker(bridge.seenAssistantUsageIds);
-      const mapState: MapState = { messageId: null };
+      const usageTracker = new TurnUsageTracker(bridge.reportedUsage);
+      const mapState: MapState = bridge.usageState;
       let streamedToolCalls = 0;
       let streamError: string | null = null;
       let resultUsage: OpenAIUsage | null = null;

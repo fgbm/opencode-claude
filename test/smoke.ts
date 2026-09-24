@@ -75,8 +75,9 @@ async function main() {
   // Usage: the final message_delta count wins over the opening snapshot
   {
     const { TurnUsageTracker, usageFromAnthropic } = await import("../src/usage.ts");
-    const seen = new Set<string>();
-    const tracker = new TurnUsageTracker(seen);
+    type OpenAIUsage = NonNullable<ReturnType<typeof usageFromAnthropic>>;
+    const reported = new Map<string, OpenAIUsage>();
+    const tracker = new TurnUsageTracker(reported);
     const start = usageFromAnthropic({ input_tokens: 8, cache_read_input_tokens: 800, output_tokens: 4 })!;
     const final = usageFromAnthropic({ input_tokens: 8, cache_read_input_tokens: 800, output_tokens: 191, output_tokens_details: { thinking_tokens: 112 } })!;
     tracker.add(start, "msg_1");
@@ -90,9 +91,19 @@ async function main() {
     assert.equal(total.prompt_tokens_details?.cached_tokens, 800);
     assert.equal(total.completion_tokens_details?.reasoning_tokens, 112);
     // A continuation response does not recount calls reported earlier
-    const next = new TurnUsageTracker(seen);
+    const next = new TurnUsageTracker(reported);
     next.add(final, "msg_1");
     assert.equal(next.total(), null);
+    // ...but settles output that grew after the earlier report
+    const early = new Map<string, OpenAIUsage>();
+    const first = new TurnUsageTracker(early);
+    first.add(start, "msg_1");
+    assert.equal(first.total()!.completion_tokens, 4);
+    const rest = new TurnUsageTracker(early);
+    rest.add(final, "msg_1");
+    const settled = rest.total()!;
+    assert.equal(settled.completion_tokens, 187);
+    assert.equal(settled.prompt_tokens, 0);
   }
 
   // Request kinds: hooked session requests vs stateless generation
@@ -1340,6 +1351,126 @@ async function main() {
       const sysPrompt = seenParams.systemPrompt as { append?: string };
       assert.match(sysPrompt.append ?? "", /mcp__opencode__todowrite/);
       assert.match(sysPrompt.append ?? "", /[Bb]atch independent tool calls/);
+
+      // Proxy + mock SDK: a tool-call API message ends with `message_delta`
+      // AFTER the tool call parks the turn. That event must survive the park
+      // (read by the continuation), or the call's real output count is lost.
+      setClaudeQueryStarter(async (params) => {
+        const tools = (
+          params as unknown as {
+            mcpServers: {
+              opencode: {
+                instance: {
+                  _registeredTools: Record<
+                    string,
+                    { handler: (a: unknown, e: unknown) => Promise<unknown> }
+                  >;
+                };
+              };
+            };
+          }
+        ).mcpServers.opencode.instance._registeredTools;
+        return {
+          stream: (async function* () {
+            yield { type: "system", subtype: "init", session_id: "park-sess" };
+            yield {
+              type: "stream_event",
+              event: { type: "message_start", message: { id: "msg-a" } },
+            };
+            yield {
+              type: "assistant",
+              message: {
+                id: "msg-a",
+                content: [{ type: "tool_use" }],
+                usage: { input_tokens: 10, output_tokens: 4 },
+              },
+            };
+            const toolDone = tools.todowrite.handler({}, {});
+            await new Promise((r) => setTimeout(r, 20));
+            yield {
+              type: "stream_event",
+              event: { type: "message_delta", usage: { output_tokens: 108 } },
+            };
+            await toolDone;
+            yield {
+              type: "stream_event",
+              event: { type: "message_start", message: { id: "msg-b" } },
+            };
+            yield {
+              type: "stream_event",
+              event: {
+                type: "content_block_delta",
+                delta: { type: "text_delta", text: "PARK_DONE" },
+              },
+            };
+            yield {
+              type: "stream_event",
+              event: { type: "message_delta", usage: { output_tokens: 62 } },
+            };
+            yield { type: "result", is_error: false, usage: {} };
+          })(),
+          interrupt: async () => {},
+          close: () => {},
+          getPid: () => null,
+        };
+      });
+      const parkTools = [
+        {
+          type: "function",
+          function: {
+            name: "todowrite",
+            description: "Write the todo list",
+            parameters: { type: "object", properties: {} },
+          },
+        },
+      ];
+      const parkHeaders = {
+        "content-type": "application/json",
+        "x-opencode-claude-session": "smoke-park-usage",
+      };
+      const firstRes = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+        method: "POST",
+        headers: parkHeaders,
+        body: JSON.stringify({
+          model: "sonnet",
+          stream: false,
+          tools: parkTools,
+          messages: [{ role: "user", content: "plan" }],
+        }),
+      });
+      const firstJson = (await firstRes.json()) as {
+        choices: Array<{
+          message: { tool_calls?: Array<{ id: string; function: { name: string } }> };
+        }>;
+        usage?: { completion_tokens?: number };
+      };
+      const parkCall = firstJson.choices[0].message.tool_calls?.[0];
+      assert.equal(parkCall?.function.name, "todowrite");
+      const secondRes = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+        method: "POST",
+        headers: parkHeaders,
+        body: JSON.stringify({
+          model: "sonnet",
+          stream: false,
+          tools: parkTools,
+          messages: [
+            { role: "user", content: "plan" },
+            { role: "assistant", content: "", tool_calls: [{ id: parkCall!.id, type: "function", function: { name: "todowrite", arguments: "{}" } }] },
+            { role: "tool", tool_call_id: parkCall!.id, content: "ok" },
+          ],
+        }),
+      });
+      const secondJson = (await secondRes.json()) as {
+        choices: Array<{ message: { content?: string } }>;
+        usage?: { completion_tokens?: number };
+      };
+      assert.match(String(secondJson.choices[0].message.content), /PARK_DONE/);
+      // 4 (snapshot) + 104 (msg-a settled after park) + 62 (msg-b) = 170
+      assert.equal(
+        (firstJson.usage?.completion_tokens ?? 0) +
+          (secondJson.usage?.completion_tokens ?? 0),
+        170,
+      );
 
       // Proxy + mock SDK: hard limit error BEFORE any content — the proxy
       // must answer with a truthful HTTP 429 (not a fake-200 error stream),

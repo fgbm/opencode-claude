@@ -294,19 +294,54 @@ function maxUsage(a: OpenAIUsage, b: OpenAIUsage): OpenAIUsage {
   };
 }
 
+function subtractUsage(a: OpenAIUsage, b: OpenAIUsage): OpenAIUsage | null {
+  const diff = (x?: number, y?: number) => Math.max(0, (x ?? 0) - (y ?? 0));
+  const prompt = diff(a.prompt_tokens, b.prompt_tokens);
+  const completion = diff(a.completion_tokens, b.completion_tokens);
+  const cached = diff(
+    a.prompt_tokens_details?.cached_tokens,
+    b.prompt_tokens_details?.cached_tokens,
+  );
+  const cacheWrite = diff(
+    a.prompt_tokens_details?.cache_write_tokens,
+    b.prompt_tokens_details?.cache_write_tokens,
+  );
+  const reasoning = diff(
+    a.completion_tokens_details?.reasoning_tokens,
+    b.completion_tokens_details?.reasoning_tokens,
+  );
+  if (prompt + completion + cached + cacheWrite + reasoning === 0) return null;
+  const promptDetails: NonNullable<OpenAIUsage["prompt_tokens_details"]> = {};
+  if (cached > 0) promptDetails.cached_tokens = cached;
+  if (cacheWrite > 0) promptDetails.cache_write_tokens = cacheWrite;
+  return {
+    prompt_tokens: prompt,
+    completion_tokens: completion,
+    total_tokens: prompt + completion,
+    ...(Object.keys(promptDetails).length
+      ? { prompt_tokens_details: promptDetails }
+      : {}),
+    ...(reasoning > 0
+      ? { completion_tokens_details: { reasoning_tokens: reasoning } }
+      : {}),
+  };
+}
+
 /**
  * Per-HTTP-response usage, one entry per Anthropic API call. The SDK reports
  * a call's usage several times: the assistant events carry the message_start
  * snapshot (output_tokens ≈ 1-4) and only message_delta has the final
  * output. Keeping the max per message id makes the final numbers win.
- * `seen` spans continuations of one bridge, so a call already reported in an
- * earlier response is not counted again.
+ * `reported` spans continuations of one bridge: a call already reported in an
+ * earlier response contributes only what grew since then — the final
+ * message_delta of a tool-call message arrives after the turn parks, so the
+ * continuation settles the rest of its output.
  */
 export class TurnUsageTracker {
   private readonly byId = new Map<string, OpenAIUsage>();
   private anonymous: OpenAIUsage | null = null;
 
-  constructor(private readonly seen: Set<string>) {}
+  constructor(private readonly reported: Map<string, OpenAIUsage>) {}
 
   add(usage: OpenAIUsage, messageId: string | null): void {
     if (!messageId) {
@@ -314,14 +349,21 @@ export class TurnUsageTracker {
       return;
     }
     const current = this.byId.get(messageId);
-    if (!current && this.seen.has(messageId)) return;
-    this.seen.add(messageId);
     this.byId.set(messageId, current ? maxUsage(current, usage) : usage);
   }
 
+  /** This response's usage; marks it reported for later continuations. */
   total(): OpenAIUsage | null {
     let sum = this.anonymous ? { ...this.anonymous } : null;
-    for (const usage of this.byId.values()) sum = addOpenAIUsage(sum, usage);
+    for (const [id, usage] of this.byId) {
+      const prev = this.reported.get(id);
+      const merged = prev ? maxUsage(prev, usage) : usage;
+      this.reported.set(id, merged);
+      const fresh = prev ? subtractUsage(merged, prev) : merged;
+      if (fresh) sum = addOpenAIUsage(sum, fresh);
+    }
+    this.byId.clear();
+    this.anonymous = null;
     return sum;
   }
 }
