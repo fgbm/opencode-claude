@@ -519,39 +519,136 @@ async function main() {
     assert.match(withReasoning, /\[reasoning\]/);
     assert.match(withReasoning, /failing assertion/);
 
-    // spill replaces truncation: path, size, tail, and the middle is on disk
-    const { mkdtempSync, readFileSync, rmSync } = await import("node:fs");
+    // long output is cut to head/tail; the middle is dropped, not saved
+    const { mkdtempSync, readdirSync, rmSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
     const { join } = await import("node:path");
-    const spillDir = mkdtempSync(join(tmpdir(), "opencode-claude-spill-"));
-    const prevSpillDir = process.env.OPENCODE_CLAUDE_SPILL_DIR;
+    const dataHome = mkdtempSync(join(tmpdir(), "opencode-claude-data-"));
+    const prevDataHome = process.env.XDG_DATA_HOME;
     const prevSpillChars = process.env.OPENCODE_CLAUDE_SPILL_CHARS;
-    process.env.OPENCODE_CLAUDE_SPILL_DIR = spillDir;
+    process.env.XDG_DATA_HOME = dataHome;
     process.env.OPENCODE_CLAUDE_SPILL_CHARS = "1000";
     try {
       const middle = "MIDDLE-MARKER-NOT-INLINED";
       const payload = `${"H".repeat(400)}${middle}${"m".repeat(1000)}${"T".repeat(2000)}`;
-      const spilled = buildConversationTranscript([
+      const cut = buildConversationTranscript([
         {
           role: "tool",
           name: "shell",
           content: payload,
         },
       ]);
-      assert.match(spilled, /output spilled/);
-      assert.match(spilled, new RegExp(`size: ${payload.length}`));
-      assert.match(spilled, /path: /);
-      assert.doesNotMatch(spilled, /MIDDLE-MARKER-NOT-INLINED/);
-      assert.match(spilled, /T{20}/);
-      const pathMatch = spilled.match(/path: (\S+)/);
-      assert.ok(pathMatch, "spill path present");
-      assert.match(readFileSync(pathMatch![1], "utf8"), /MIDDLE-MARKER-NOT-INLINED/);
+      assert.match(cut, /output cut/);
+      assert.match(cut, new RegExp(`${payload.length} chars`));
+      assert.doesNotMatch(cut, /MIDDLE-MARKER-NOT-INLINED/);
+      assert.match(cut, /T{20}/);
+      assert.match(cut, /re-run the command narrowed/);
+      assert.doesNotMatch(cut, /path: /);
+      assert.deepEqual(readdirSync(dataHome), [], "nothing written to disk");
+
+      // a live file read is never cut: the file is already on disk
+      const { presentToolResult } = await import("../src/spill.ts");
+      const readArgs = JSON.stringify({ path: "/repo/AGENTS.md" });
+      const live = presentToolResult("read", payload);
+      assert.equal(live.text, payload);
+      assert.equal(live.spilledChars, 0);
+      assert.equal(presentToolResult("mcp__opencode__read", payload).text, payload);
+      assert.match(presentToolResult("shell", payload).text, /output cut/);
+
+      // in history a long read points back at its source file
+      const replayed = buildConversationTranscript([
+        {
+          role: "assistant",
+          content: "",
+          tool_calls: [{ id: "r1", function: { name: "read", arguments: readArgs } }],
+        },
+        { role: "tool", tool_call_id: "r1", content: payload },
+      ]);
+      assert.match(replayed, /Tool result \(read\)/);
+      assert.match(replayed, /file read elided from history/);
+      assert.match(replayed, /source: \/repo\/AGENTS\.md/);
+      assert.doesNotMatch(replayed, /output cut/);
     } finally {
-      if (prevSpillDir === undefined) delete process.env.OPENCODE_CLAUDE_SPILL_DIR;
-      else process.env.OPENCODE_CLAUDE_SPILL_DIR = prevSpillDir;
+      if (prevDataHome === undefined) delete process.env.XDG_DATA_HOME;
+      else process.env.XDG_DATA_HOME = prevDataHome;
       if (prevSpillChars === undefined) delete process.env.OPENCODE_CLAUDE_SPILL_CHARS;
       else process.env.OPENCODE_CLAUDE_SPILL_CHARS = prevSpillChars;
-      rmSync(spillDir, { recursive: true, force: true });
+      rmSync(dataHome, { recursive: true, force: true });
+    }
+
+    // cut outputs stay readable from memory; the store never exceeds its cap
+    {
+      const { OutputStore, formatSlice } = await import("../src/output-store.ts");
+      const { presentLargeOutput } = await import("../src/spill.ts");
+      let clock = 0;
+      const now = () => clock;
+      const kb = (n: number, ch: string) => ch.repeat(n * 512); // n KB as UTF-16
+
+      // the note carries an id and the dropped middle comes back by slice
+      const store = new OutputStore({ maxBytes: 1024 * 1024, now });
+      const middle = "MIDDLE-MARKER-KEPT-IN-MEMORY";
+      const payload = `${"H".repeat(400)}${middle}${"m".repeat(6000)}${"T".repeat(2000)}`;
+      const cut = presentLargeOutput(payload, { threshold: 1000, store });
+      assert.doesNotMatch(cut.text, /MIDDLE-MARKER/);
+      const id = cut.text.match(/output id: (o[0-9a-f]+)/)?.[1];
+      assert.ok(id, "cut note carries an output id");
+      assert.match(cut.text, /output_slice\(id="o[0-9a-f]+", offset=400\)/);
+      const slice = store.slice(id!, 400, 100);
+      assert.ok(slice.ok);
+      assert.ok(slice.ok && slice.text.startsWith(middle));
+      assert.match(formatSlice(id!, slice), /chars 400-500 of \d+; next: output_slice/);
+      // a slice never exceeds the per-call cap
+      const whole = store.slice(id!, 0, 1_000_000);
+      assert.ok(whole.ok && whole.text.length === 8000);
+      // the same output is stored once
+      assert.equal(store.put(payload), id);
+      assert.equal(store.size, 1);
+
+      // the cap holds under a stream of entries; least recently used goes first
+      const small = new OutputStore({ maxBytes: 100 * 1024, now });
+      const a = small.put(kb(40, "a"))!;
+      const b = small.put(kb(40, "b"))!;
+      assert.ok(small.slice(a).ok); // touch a, so b is now the oldest
+      const c = small.put(kb(40, "c"))!;
+      assert.ok(small.bytes <= 100 * 1024);
+      assert.equal(small.slice(b).ok, false, "LRU entry evicted");
+      assert.ok(small.slice(a).ok && small.slice(c).ok);
+      for (let i = 0; i < 50; i++) small.put(kb(30, String.fromCharCode(100 + i)));
+      assert.ok(small.bytes <= 100 * 1024, `cap held: ${small.bytes}`);
+
+      // an output above the per-entry cap is not kept and falls back to the plain note
+      const capped = new OutputStore({ maxBytes: 1024 * 1024, maxEntryBytes: 64 * 1024, now });
+      assert.equal(capped.put(kb(65, "z")), undefined);
+      assert.equal(capped.size, 0);
+      const plain = presentLargeOutput(kb(65, "z"), { threshold: 1000, store: capped });
+      assert.doesNotMatch(plain.text, /output id/);
+      assert.match(plain.text, /not saved anywhere/);
+
+      // idle entries expire; access keeps an entry alive
+      const ttl = new OutputStore({ maxBytes: 1024 * 1024, ttlMs: 1000, now });
+      clock = 0;
+      const old = ttl.put("old output")!;
+      const kept = ttl.put("kept output")!;
+      clock = 900;
+      assert.ok(ttl.slice(kept).ok);
+      clock = 1500;
+      const gone = ttl.slice(old);
+      assert.equal(gone.ok, false);
+      assert.match(formatSlice(old, gone), /no longer available/);
+      assert.ok(ttl.slice(kept).ok);
+      assert.equal(ttl.size, 1);
+      assert.ok(ttl.bytes === "kept output".length * 2);
+
+      // a zero cap disables the store
+      const off = new OutputStore({ maxBytes: 0, now });
+      assert.equal(off.put("anything"), undefined);
+      const prevStore = process.env.OPENCODE_CLAUDE_OUTPUT_STORE_MB;
+      const { outputStoreEnabled } = await import("../src/output-store.ts");
+      process.env.OPENCODE_CLAUDE_OUTPUT_STORE_MB = "0";
+      assert.equal(outputStoreEnabled(), false);
+      if (prevStore === undefined) delete process.env.OPENCODE_CLAUDE_OUTPUT_STORE_MB;
+      else process.env.OPENCODE_CLAUDE_OUTPUT_STORE_MB = prevStore;
+      assert.equal(outputStoreEnabled(), true);
     }
 
     const { openCodeSystemAppend } = await import("../src/prompt.ts");
@@ -564,15 +661,6 @@ async function main() {
       openCodeSystemAppend(["read"], "v2"),
       openCodeSystemAppend(["todowrite", "read"], "v2"),
     );
-
-    const { referencesSpillFile } = await import("../src/spill.ts");
-    process.env.OPENCODE_CLAUDE_SPILL_DIR = spillDir;
-    assert.equal(
-      referencesSpillFile(JSON.stringify({ path: join(spillDir, "spill-abc.txt") })),
-      true,
-    );
-    assert.equal(referencesSpillFile(JSON.stringify({ path: "/tmp/other.txt" })), false);
-    delete process.env.OPENCODE_CLAUDE_SPILL_DIR;
 
     // spill disabled restores middle truncation
     process.env.OPENCODE_CLAUDE_SPILL_CHARS = "0";
@@ -1367,7 +1455,7 @@ async function main() {
         [...registeredNames].sort(),
         "bridged tools are registered in a stable name order",
       );
-      assert.deepEqual(registeredNames, ["question", "todowrite"]);
+      assert.deepEqual(registeredNames, ["output_slice", "question", "todowrite"]);
       const bridged = registeredTools?.question?.inputSchema;
       assert.ok(bridged, "question tool bridged");
       const { z: zod } = await import("zod");

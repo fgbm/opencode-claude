@@ -2,7 +2,12 @@
  * Build Claude Agent SDK prompts from OpenAI-compatible chat messages,
  * including text, images, and PDF/document attachments.
  */
-import { presentLargeOutput, spillThreshold } from "./spill.js";
+import {
+  isFileReadTool,
+  presentHistoricalRead,
+  presentLargeOutput,
+  spillThreshold,
+} from "./spill.js";
 export type AnthropicContentBlock =
   | { type: "text"; text: string }
   | {
@@ -529,8 +534,11 @@ function reasoningFromMessage(msg: ConversationHistoryMessage): string {
   return [...direct, ...blocks.filter(Boolean)].join("\n");
 }
 
+type HistoryToolCall = { name?: string; arguments?: string };
+
 function serializeHistoryMessage(
   msg: ConversationHistoryMessage,
+  calls: ReadonlyMap<string, HistoryToolCall> = new Map(),
 ): string | null {
   if (!msg || typeof msg !== "object") return null;
   const role = msg.role;
@@ -562,16 +570,22 @@ function serializeHistoryMessage(
   if (role === "tool") {
     const text = extractTextContent(msg.content).trim();
     if (!text) return null;
+    const call =
+      typeof msg.tool_call_id === "string" ? calls.get(msg.tool_call_id) : undefined;
+    const name = (typeof msg.name === "string" && msg.name) || call?.name;
     const label =
-      (typeof msg.name === "string" && msg.name) ||
+      name ||
       (typeof msg.tool_call_id === "string" && msg.tool_call_id) ||
       "tool";
-    // Spilling is on by default. When it is disabled, keep the old middle
-    // truncation so a disabled spill does not inline the whole result.
+    // Cutting to head/tail is on by default. When it is disabled, keep the
+    // old middle truncation so history does not inline the whole result.
+    // File reads point back at their source instead of being copied out.
     const body =
-      spillThreshold() > 0
-        ? presentLargeOutput(text).text
-        : truncateMiddle(text, TOOL_RESULT_MAX_CHARS);
+      spillThreshold() <= 0
+        ? truncateMiddle(text, TOOL_RESULT_MAX_CHARS)
+        : isFileReadTool(name)
+          ? presentHistoricalRead(text, call?.arguments)
+          : presentLargeOutput(text).text;
     return `Tool result (${label}):\n${body}`;
   }
 
@@ -601,9 +615,15 @@ export function buildConversationTranscript(
   maxChars: number = historyMaxChars(),
 ): string {
   if (maxChars <= 0) return "";
+  const calls = new Map<string, HistoryToolCall>();
+  for (const msg of messages) {
+    for (const call of msg?.tool_calls ?? []) {
+      if (call?.id) calls.set(call.id, call.function ?? {});
+    }
+  }
   const serialized: string[] = [];
   for (const msg of messages) {
-    const line = serializeHistoryMessage(msg);
+    const line = serializeHistoryMessage(msg, calls);
     if (line) serialized.push(line);
   }
   if (serialized.length === 0) return "";
