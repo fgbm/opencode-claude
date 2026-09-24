@@ -20,7 +20,7 @@ import {
   resolveClaudeModelSelection,
 } from "./model-selection.js";
 import { getClaudeModels } from "./models.js";
-import { getClaudeProxyBaseUrl, startProxy, stopProxy } from "./proxy.js";
+import { getClaudeProxyBaseUrl, startProxy } from "./proxy.js";
 
 const AUTH_METHOD_ID = "claude-cli";
 const PROVIDER_PACKAGE = "@opencode/ai/providers/openai-compatible";
@@ -187,10 +187,12 @@ export default Plugin.define({
       await ctx.session.hook("http.request", onRequest, { providerID: PROVIDER_ID });
       await ctx.session.hook("model.request", onRequest, { providerID: PROVIDER_ID });
     } catch (error) {
-      await stopProxy();
+      // The proxy is shared process-wide: a failed location setup must not
+      // stop the listener that other locations are already using.
       throw error;
     }
 
-    return stopProxy;
+    // No cleanup: the proxy lives for the whole server process, so unloading
+    // one location never interrupts Claude turns running in another.
   },
 });
