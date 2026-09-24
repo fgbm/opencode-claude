@@ -19,6 +19,13 @@ export type OpenAIUsage = {
   completion_tokens_details?: {
     reasoning_tokens?: number;
   };
+  /**
+   * Split of cache_write_tokens by Anthropic TTL. Not part of the OpenAI
+   * usage object sent back to OpenCode — stripped by {@link clientUsage}.
+   * A 1-hour write costs 2× input; a 5-minute write costs 1.25×.
+   */
+  cache_write_5m_tokens?: number;
+  cache_write_1h_tokens?: number;
   /** Estimated USD from the Agent SDK (not a billing statement). */
   cost_usd?: number;
   /** Per-model breakdown when the SDK provides modelUsage. */
@@ -39,6 +46,21 @@ function asNumber(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
+function cacheWriteSplit(usage: Record<string, unknown>): {
+  write5m: number;
+  write1h: number;
+} {
+  const creation = usage.cache_creation;
+  if (!creation || typeof creation !== "object") {
+    return { write5m: 0, write1h: 0 };
+  }
+  const c = creation as Record<string, unknown>;
+  return {
+    write5m: asNumber(c.ephemeral_5m_input_tokens),
+    write1h: asNumber(c.ephemeral_1h_input_tokens),
+  };
+}
+
 function fromAnthropicUsage(usage: Record<string, unknown>): OpenAIUsage {
   const input = asNumber(usage.input_tokens);
   const completion = asNumber(usage.output_tokens);
@@ -56,6 +78,7 @@ function fromAnthropicUsage(usage: Record<string, unknown>): OpenAIUsage {
     | Record<string, unknown>
     | undefined;
   const thinking = asNumber(outputDetails?.thinking_tokens);
+  const split = cacheWriteSplit(usage);
   return {
     prompt_tokens: prompt,
     completion_tokens: completion,
@@ -64,6 +87,8 @@ function fromAnthropicUsage(usage: Record<string, unknown>): OpenAIUsage {
     ...(thinking > 0
       ? { completion_tokens_details: { reasoning_tokens: thinking } }
       : {}),
+    ...(split.write5m > 0 ? { cache_write_5m_tokens: split.write5m } : {}),
+    ...(split.write1h > 0 ? { cache_write_1h_tokens: split.write1h } : {}),
   };
 }
 
@@ -173,12 +198,27 @@ export function usageFromAssistantEvent(event: unknown): OpenAIUsage | null {
   return fromAnthropicUsage(usage as Record<string, unknown>);
 }
 
+export type UsageSections = {
+  kind?: string;
+  resumed?: boolean;
+  history_chars?: number;
+  tool_schema_chars?: number;
+  system_append_chars?: number;
+  user_chars?: number;
+  tools_offered?: number;
+  tool_names?: string[];
+  tool_errors?: string[];
+  spilled_chars?: number;
+  hop?: "query" | "continuation" | "replay";
+};
+
 export type UsageLogEntry = {
   conversationKey: string;
   model: string;
   usage: OpenAIUsage | null;
   toolCalls: number;
   error?: string;
+  sections?: UsageSections;
 };
 
 function usageLogEnabled(): boolean {
@@ -202,6 +242,9 @@ export function recordUsage(entry: UsageLogEntry): void {
   const u = entry.usage;
   const cacheRead = u?.prompt_tokens_details?.cached_tokens ?? 0;
   const cacheWrite = u?.prompt_tokens_details?.cache_write_tokens ?? 0;
+  const write5m = u?.cache_write_5m_tokens ?? 0;
+  const write1h = u?.cache_write_1h_tokens ?? 0;
+  const turnCost = estimateTurnCostUsd(entry.model, u);
   const line = {
     ts: new Date().toISOString(),
     conversationKey: entry.conversationKey,
@@ -209,9 +252,15 @@ export function recordUsage(entry: UsageLogEntry): void {
     input: u ? u.prompt_tokens - cacheRead - cacheWrite : 0,
     cache_read: cacheRead,
     cache_write: cacheWrite,
+    ...(write5m > 0 ? { cache_write_5m: write5m } : {}),
+    ...(write1h > 0 ? { cache_write_1h: write1h } : {}),
     output: u?.completion_tokens ?? 0,
     tool_calls: entry.toolCalls,
+    // cost_usd is the SDK figure and is cumulative for the resumed query,
+    // not this hop. turn_cost_usd is the price of the tokens on this line.
     ...(u?.cost_usd !== undefined ? { cost_usd: u.cost_usd } : {}),
+    ...(turnCost !== null ? { turn_cost_usd: turnCost } : {}),
+    ...(entry.sections ? { sections: entry.sections } : {}),
     ...(entry.error ? { error: entry.error.slice(0, 200) } : {}),
   };
   try {
@@ -240,6 +289,10 @@ export function addOpenAIUsage(
   const reasoning =
     (acc.completion_tokens_details?.reasoning_tokens ?? 0) +
     (delta.completion_tokens_details?.reasoning_tokens ?? 0);
+  const write5m =
+    (acc.cache_write_5m_tokens ?? 0) + (delta.cache_write_5m_tokens ?? 0);
+  const write1h =
+    (acc.cache_write_1h_tokens ?? 0) + (delta.cache_write_1h_tokens ?? 0);
   const promptDetails: NonNullable<OpenAIUsage["prompt_tokens_details"]> = {};
   if (cached > 0) promptDetails.cached_tokens = cached;
   if (cacheWrite > 0) promptDetails.cache_write_tokens = cacheWrite;
@@ -253,6 +306,8 @@ export function addOpenAIUsage(
     ...(reasoning > 0
       ? { completion_tokens_details: { reasoning_tokens: reasoning } }
       : {}),
+    ...(write5m > 0 ? { cache_write_5m_tokens: write5m } : {}),
+    ...(write1h > 0 ? { cache_write_1h_tokens: write1h } : {}),
   };
 }
 
@@ -278,6 +333,8 @@ function maxUsage(a: OpenAIUsage, b: OpenAIUsage): OpenAIUsage {
   );
   const prompt = pick(a.prompt_tokens, b.prompt_tokens);
   const completion = pick(a.completion_tokens, b.completion_tokens);
+  const write5m = pick(a.cache_write_5m_tokens, b.cache_write_5m_tokens);
+  const write1h = pick(a.cache_write_1h_tokens, b.cache_write_1h_tokens);
   const promptDetails: NonNullable<OpenAIUsage["prompt_tokens_details"]> = {};
   if (cached > 0) promptDetails.cached_tokens = cached;
   if (cacheWrite > 0) promptDetails.cache_write_tokens = cacheWrite;
@@ -291,6 +348,8 @@ function maxUsage(a: OpenAIUsage, b: OpenAIUsage): OpenAIUsage {
     ...(reasoning > 0
       ? { completion_tokens_details: { reasoning_tokens: reasoning } }
       : {}),
+    ...(write5m > 0 ? { cache_write_5m_tokens: write5m } : {}),
+    ...(write1h > 0 ? { cache_write_1h_tokens: write1h } : {}),
   };
 }
 
@@ -312,6 +371,8 @@ function usageGrowth(a: OpenAIUsage, b: OpenAIUsage | null): OpenAIUsage | null 
     a.completion_tokens_details?.reasoning_tokens,
     b.completion_tokens_details?.reasoning_tokens,
   );
+  const write5m = diff(a.cache_write_5m_tokens, b.cache_write_5m_tokens);
+  const write1h = diff(a.cache_write_1h_tokens, b.cache_write_1h_tokens);
   if (prompt + completion + cached + cacheWrite + reasoning === 0) return null;
   const promptDetails: NonNullable<OpenAIUsage["prompt_tokens_details"]> = {};
   if (cached > 0) promptDetails.cached_tokens = cached;
@@ -326,6 +387,8 @@ function usageGrowth(a: OpenAIUsage, b: OpenAIUsage | null): OpenAIUsage | null 
     ...(reasoning > 0
       ? { completion_tokens_details: { reasoning_tokens: reasoning } }
       : {}),
+    ...(write5m > 0 ? { cache_write_5m_tokens: write5m } : {}),
+    ...(write1h > 0 ? { cache_write_1h_tokens: write1h } : {}),
   };
 }
 
@@ -373,6 +436,102 @@ export class TurnUsageTracker {
     }
     return sum;
   }
+}
+
+/**
+ * Usage object safe to put on the OpenAI response. Drops harness-only
+ * cache-TTL fields so OpenCode's parser sees the same shape as before.
+ */
+export function clientUsage(usage: OpenAIUsage): OpenAIUsage {
+  const { cache_write_5m_tokens: _write5m, cache_write_1h_tokens: _write1h, ...rest } =
+    usage;
+  return rest;
+}
+
+/**
+ * Published API rates, USD per million tokens, checked 2026-09-24.
+ * Opus 5.5 cache read is $0.20 (0.05×), not the usual 0.1×. A 1-hour cache
+ * write is 2× input; a 5-minute write is 1.25×. The `opus` alias is priced
+ * as claude-opus-5-5 because that is the id the local CLI billed on this date.
+ * Unknown cache writes (no TTL split) are priced as 1-hour writes — the TTL
+ * the measured CLI sessions actually used.
+ */
+const MODEL_PRICES: Record<
+  string,
+  {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite5m: number;
+    cacheWrite1h: number;
+  }
+> = {
+  "claude-opus-5-5": {
+    input: 4,
+    output: 20,
+    cacheRead: 0.2,
+    cacheWrite5m: 5,
+    cacheWrite1h: 8,
+  },
+  "claude-opus-5": {
+    input: 5,
+    output: 25,
+    cacheRead: 0.5,
+    cacheWrite5m: 6.25,
+    cacheWrite1h: 10,
+  },
+  "claude-sonnet-5": {
+    input: 2,
+    output: 10,
+    cacheRead: 0.2,
+    cacheWrite5m: 2.5,
+    cacheWrite1h: 4,
+  },
+  "claude-haiku-4-5": {
+    input: 1,
+    output: 5,
+    cacheRead: 0.1,
+    cacheWrite5m: 1.25,
+    cacheWrite1h: 2,
+  },
+  "claude-fable-5-1": {
+    input: 10,
+    output: 50,
+    cacheRead: 0.25,
+    cacheWrite5m: 12.5,
+    cacheWrite1h: 20,
+  },
+};
+
+const PRICE_ALIASES: Record<string, string> = {
+  opus: "claude-opus-5-5",
+  sonnet: "claude-sonnet-5",
+  haiku: "claude-haiku-4-5",
+  fable: "claude-fable-5-1",
+};
+
+export function estimateTurnCostUsd(
+  model: string,
+  usage: OpenAIUsage | null,
+): number | null {
+  if (!usage) return null;
+  const id = model.split("/").pop() ?? model;
+  const price = MODEL_PRICES[id] ?? MODEL_PRICES[PRICE_ALIASES[id] ?? ""];
+  if (!price) return null;
+  const cacheRead = usage.prompt_tokens_details?.cached_tokens ?? 0;
+  const cacheWrite = usage.prompt_tokens_details?.cache_write_tokens ?? 0;
+  const write5m = usage.cache_write_5m_tokens ?? 0;
+  const write1h = usage.cache_write_1h_tokens ?? 0;
+  const writeUnknown = Math.max(0, cacheWrite - write5m - write1h);
+  const input = usage.prompt_tokens - cacheRead - cacheWrite;
+  const usd =
+    (input * price.input +
+      usage.completion_tokens * price.output +
+      cacheRead * price.cacheRead +
+      write5m * price.cacheWrite5m +
+      (write1h + writeUnknown) * price.cacheWrite1h) /
+    1_000_000;
+  return Math.round(usd * 1e9) / 1e9;
 }
 
 /** Count a replayed SDK assistant message only once across tool continuations. */

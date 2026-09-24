@@ -17,6 +17,7 @@ import {
   putBridge,
   type ParkedBridge,
   type ParkedToolCall,
+  type TurnAccounting,
 } from "./bridge-pool.js";
 import { buildClaudeCodeChildEnv } from "./auth-env.js";
 import {
@@ -74,6 +75,7 @@ import {
   type McpToolResultContent,
   type SdkUserPrompt,
 } from "./prompt.js";
+import { presentLargeOutput } from "./spill.js";
 import {
   detectMetaRequestKind,
   metaSystemPrompt,
@@ -83,12 +85,14 @@ import {
 import {
   TurnUsageTracker,
   usageFromAnthropic,
+  clientUsage,
   formatCompactNote,
   resolveTurnUsage,
   recordUsage,
   usageFromAssistantEvent,
   usageFromSdkResult,
   type OpenAIUsage,
+  type UsageSections,
 } from "./usage.js";
 
 const SHARED_PROXY_HEALTH_TIMEOUT_MS = 750;
@@ -192,6 +196,74 @@ type ChatCompletionRequest = {
   stream?: boolean;
   temperature?: number;
 };
+
+function orderedTools(tools: OpenAITool[]): OpenAITool[] {
+  return [...tools].sort((a, b) => {
+    const an = a.function?.name ?? "";
+    const bn = b.function?.name ?? "";
+    if (an < bn) return -1;
+    if (an > bn) return 1;
+    return 0;
+  });
+}
+
+/** Stable object-key order so a reshuffled schema does not bust the cache prefix. Arrays keep their order (required-key order is semantic to callers). */
+function stableSchema(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableSchema);
+  if (!value || typeof value !== "object") return value;
+  const src = value as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(src).sort()) {
+    out[key] = stableSchema(src[key]);
+  }
+  return out;
+}
+
+function toolSchemaChars(tools: OpenAITool[]): number {
+  let chars = 0;
+  for (const tool of tools) {
+    const fn = tool.function;
+    if (!fn) continue;
+    chars += (fn.name ?? "").length;
+    chars += (fn.description ?? "").length;
+    if (fn.parameters) chars += JSON.stringify(fn.parameters).length;
+  }
+  return chars;
+}
+
+function userPromptChars(prompt: string | SdkUserPrompt): number {
+  if (typeof prompt === "string") return prompt.length;
+  const content = prompt.message.content;
+  if (typeof content === "string") return content.length;
+  return content
+    .filter((block) => block.type === "text")
+    .reduce((sum, block) => sum + block.text.length, 0);
+}
+
+function usageSections(
+  accounting: TurnAccounting | undefined,
+  hop: UsageSections["hop"],
+  toolNames: string[],
+): UsageSections | undefined {
+  if (!accounting) return undefined;
+  return {
+    kind: accounting.kind,
+    resumed: accounting.resumed,
+    history_chars: accounting.historyChars,
+    tool_schema_chars: accounting.toolSchemaChars,
+    system_append_chars: accounting.systemAppendChars,
+    user_chars: accounting.userChars,
+    tools_offered: accounting.toolsOffered,
+    ...(toolNames.length ? { tool_names: toolNames } : {}),
+    ...(accounting.toolErrors.length
+      ? { tool_errors: [...accounting.toolErrors] }
+      : {}),
+    ...(accounting.spilledChars > 0
+      ? { spilled_chars: accounting.spilledChars }
+      : {}),
+    hop,
+  };
+}
 
 /**
  * OpenCode 2 imports the plugin module once per location, so module-level
@@ -652,8 +724,15 @@ async function handleChatCompletions(
     for (const [toolId, tool] of existing.pendingTools) {
       const result = toolResults.get(toolId);
       if (result !== undefined) {
+        const presented = presentToolResult(result);
+        if (existing.accounting) {
+          existing.accounting.spilledChars += presented.spilledChars;
+          if (presented.error) existing.accounting.toolErrors.push(tool.name);
+        }
         tool.resolve(
-          toolId === steeringToolId ? withSteering(result, steering) : result,
+          toolId === steeringToolId
+            ? withSteering(presented.blocks, steering)
+            : presented.blocks,
         );
         existing.pendingTools.delete(toolId);
         resolved++;
@@ -676,11 +755,13 @@ async function handleChatCompletions(
             existing.continueStream(),
             body.model || model,
             existing,
+            { hop: "continuation" },
           )
         : collectTurnResponse(
             existing.continueStream(),
             body.model || model,
             existing,
+            { hop: "continuation" },
           );
     }
     // Still parked — do not start a parallel Claude turn (OpenCode may retry
@@ -696,8 +777,12 @@ async function handleChatCompletions(
         yield { type: "__park__", tools: [...existing!.pendingTools.values()] };
       })();
       return stream
-        ? streamOpenAIResponse(parkedEvents, body.model || model, existing)
-        : collectTurnResponse(parkedEvents, body.model || model, existing);
+        ? streamOpenAIResponse(parkedEvents, body.model || model, existing, {
+            hop: "replay",
+          })
+        : collectTurnResponse(parkedEvents, body.model || model, existing, {
+            hop: "replay",
+          });
     }
   }
 
@@ -713,7 +798,9 @@ async function handleChatCompletions(
 
   const env = buildClaudeCodeChildEnv();
 
-  const openCodeTools = Array.isArray(body.tools) ? body.tools : [];
+  const openCodeTools = orderedTools(
+    Array.isArray(body.tools) ? body.tools : [],
+  );
   const isMetaRequest = metaKind !== null;
   const requestDirectory = req.headers.get(DIRECTORY_HEADER)?.trim();
   const cwd =
@@ -938,6 +1025,25 @@ async function handleChatCompletions(
       : promptAsStream(mainPrompt);
 
   const hasTodoWrite = openCodeToolNames.includes("todowrite");
+  const systemAppend = [
+    buildRuntimeInstructions({
+      modelName: getClaudeModels().find((m) => m.id === selection.modelId)?.name,
+      effort: selection.effort,
+    }),
+    ...(bridgeOpenCodeTools
+      ? [
+          [
+            "Built-in Claude Code tools are disabled. Use only the mcp__opencode__* tools provided for this turn; they execute via OpenCode.",
+            "Batch independent tool calls into a single turn instead of calling them one at a time.",
+            ...(hasTodoWrite
+              ? [
+                  "For any multi-step work, ALWAYS write the plan with the mcp__opencode__todowrite tool and keep it updated as you progress. A plan that only exists in your text is lost when the session is restored or handed to another agent.",
+                ]
+              : []),
+          ].join(" "),
+        ]
+      : []),
+  ].join("\n\n");
   // Generation is an explicit model choice by the caller; keep it.
   const queryModel =
     metaKind === "title" || metaKind === "summary" ? META_REQUEST_MODEL : model;
@@ -982,33 +1088,33 @@ async function handleChatCompletions(
       : {
           type: "preset",
           preset: "claude_code",
-          append: [
-            buildRuntimeInstructions({
-              modelName: getClaudeModels().find((m) => m.id === selection.modelId)?.name,
-              effort: selection.effort,
-            }),
-            ...(bridgeOpenCodeTools
-              ? [
-                  [
-                    "Built-in Claude Code tools are disabled. Use only the mcp__opencode__* tools provided for this turn; they execute via OpenCode.",
-                    "Batch independent tool calls into a single turn instead of calling them one at a time.",
-                    ...(hasTodoWrite
-                      ? [
-                          "For any multi-step work, ALWAYS write the plan with the mcp__opencode__todowrite tool and keep it updated as you progress. A plan that only exists in your text is lost when the session is restored or handed to another agent.",
-                        ]
-                      : []),
-                  ].join(" "),
-                ]
-              : []),
-          ].join("\n\n"),
+          snapshot: true,
+          ...(excludeDynamicSections() ? { excludeDynamicSections: true } : {}),
+          append: systemAppend,
         },
   });
 
+  const accounting: TurnAccounting = {
+    kind: metaKind ?? "agent",
+    resumed: Boolean(resume) && !isMetaRequest,
+    historyChars: transcript.length,
+    toolSchemaChars: toolSchemaChars(openCodeTools),
+    systemAppendChars: isMetaRequest ? UTILITY_SYSTEM_PROMPT.length : systemAppend.length,
+    userChars:
+      typeof queryPrompt === "string"
+        ? queryPrompt.length
+        : userPromptChars(contextualPrompt),
+    toolsOffered: openCodeTools.length,
+    spilledChars: 0,
+    toolNames: [],
+    toolErrors: [],
+  };
   const bridge: ParkedBridge = {
     id: bridgeId,
     conversationKey,
     handle,
     pendingTools,
+    accounting,
     reportedUsage: new Map(),
     forwardedSteering: new Set(),
     createdAt: Date.now(),
@@ -1331,18 +1437,24 @@ export async function buildOpenCodeMcpServer(
         const name = t.function?.name;
         if (!name) return null;
         const description = fitToolDescription(t.function?.description || name);
-        const params = normalizeToolParameters(t.function?.parameters);
+        const params = stableSchema(
+          normalizeToolParameters(t.function?.parameters),
+        ) as Record<string, unknown>;
         const annotations = PARALLEL_SAFE_TOOLS.has(name)
           ? { readOnlyHint: true as const }
           : undefined;
+        const defer = deferToolsEnabled() && DEFERRABLE_TOOLS.has(name);
+        const searchHint = description.split("\n")[0]?.slice(0, 200);
         listed.push({
           name,
           description,
           inputSchema: params,
           ...(annotations ? { annotations } : {}),
-          // What the SDK's own tools/list sends for alwaysLoad; without it
-          // the CLI may defer the tool behind its tool search.
-          _meta: { "anthropic/alwaysLoad": true },
+          // What the SDK's own tools/list sends for alwaysLoad / searchHint;
+          // without alwaysLoad the CLI may defer the tool behind tool search.
+          _meta: defer
+            ? { "anthropic/searchHint": searchHint }
+            : { "anthropic/alwaysLoad": true },
         });
         // Lossless zod for argument parsing; loose() keeps keys the schema
         // did not name instead of silently dropping them before OpenCode.
@@ -1385,14 +1497,20 @@ export async function buildOpenCodeMcpServer(
               content: result.length > 0 ? result : [{ type: "text", text: "" }],
             };
           },
-          { alwaysLoad: true, ...(annotations ? { annotations } : {}) },
+          {
+            alwaysLoad: !defer,
+            ...(defer ? { searchHint } : {}),
+            ...(annotations ? { annotations } : {}),
+          },
         );
       })
       .filter(Boolean);
 
     const server = createSdkMcpServer({
       name: "opencode",
-      alwaysLoad: true,
+      // Server-level alwaysLoad ORs with per-tool flags, so deferral only
+      // works when the server itself does not force every tool in.
+      alwaysLoad: !deferToolsEnabled(),
       tools: mcpTools,
     }) as { instance?: { server?: { setRequestHandler?: Function } } };
 
@@ -1426,9 +1544,10 @@ async function collectTurnResponse(
   events: AsyncIterable<unknown>,
   model: string,
   bridge: ParkedBridge,
-  options?: { suppressReasoning?: boolean },
+  options?: { suppressReasoning?: boolean; hop?: UsageSections["hop"] },
 ): Promise<Response> {
   const suppressReasoning = options?.suppressReasoning === true;
+  const hop = options?.hop ?? "query";
   const completionId = `chatcmpl_${createHash("sha1")
     .update(bridge.id)
     .digest("hex")
@@ -1497,6 +1616,11 @@ async function collectTurnResponse(
     model,
     usage,
     toolCalls: toolCalls.length,
+    sections: usageSections(
+      bridge.accounting,
+      hop,
+      toolCalls.map((tool) => tool.name),
+    ),
     ...(errorText ? { error: errorText } : {}),
   });
 
@@ -1535,7 +1659,7 @@ async function collectTurnResponse(
         finish_reason: toolCalls.length ? "tool_calls" : "stop",
       },
     ],
-    ...(usage ? { usage } : {}),
+    ...(usage ? { usage: clientUsage(usage) } : {}),
   });
 }
 
@@ -1736,9 +1860,10 @@ function streamOpenAIResponse(
   events: AsyncIterable<unknown>,
   model: string,
   bridge: ParkedBridge,
-  options?: { suppressReasoning?: boolean },
+  options?: { suppressReasoning?: boolean; hop?: UsageSections["hop"] },
 ): Response {
   const suppressReasoning = options?.suppressReasoning === true;
+  const hop = options?.hop ?? "query";
   const completionId = `chatcmpl_${createHash("sha1")
     .update(bridge.id)
     .digest("hex")
@@ -1787,6 +1912,7 @@ function streamOpenAIResponse(
       const usageTracker = new TurnUsageTracker(bridge.reportedUsage);
       const mapState: MapState = { messageId: null };
       let streamedToolCalls = 0;
+      const streamedToolNames: string[] = [];
       let streamError: string | null = null;
       let resultUsage: OpenAIUsage | null = null;
       let lastErrorNorm: string | null = null;
@@ -1840,6 +1966,7 @@ function streamOpenAIResponse(
             streamedToolCalls += mapped.tools.length;
             for (let i = 0; i < mapped.tools.length; i++) {
               const tool = mapped.tools[i];
+              streamedToolNames.push(tool.name);
               send({
                 id: completionId,
                 object: "chat.completion.chunk",
@@ -1943,6 +2070,11 @@ function streamOpenAIResponse(
         model,
         usage,
         toolCalls: streamedToolCalls,
+        sections: usageSections(
+          bridge.accounting,
+          hop,
+          streamedToolNames,
+        ),
         ...(streamError ? { error: streamError } : {}),
       });
       if (!streamClosed) {
@@ -1952,7 +2084,7 @@ function streamOpenAIResponse(
           created,
           model,
           choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
-          ...(usage ? { usage } : {}),
+          ...(usage ? { usage: clientUsage(usage) } : {}),
         });
         try {
           controller.enqueue(encoder.encode("data: [DONE]\n\n"));
@@ -2037,6 +2169,58 @@ function forgetDeadSession(conversationKey: string, errorText: string): void {
     conversationKey,
   });
   clearForeignSessionId(conversationKey);
+}
+
+/** Spill oversized text blocks of a tool result; media blocks pass through. */
+function presentToolResult(blocks: McpToolResultContent[]): {
+  blocks: McpToolResultContent[];
+  spilledChars: number;
+  error: boolean;
+} {
+  let spilledChars = 0;
+  const first = blocks.find((b) => b.type === "text");
+  const error = first?.type === "text" && looksLikeToolError(first.text);
+  const out = blocks.map((block) => {
+    if (block.type !== "text") return block;
+    const presented = presentLargeOutput(block.text);
+    spilledChars += presented.spilledChars;
+    return { type: "text" as const, text: presented.text };
+  });
+  return { blocks: out, spilledChars, error };
+}
+
+/**
+ * Tools measured as rare, and not required on the first turn of a coding
+ * task. Everything else stays loaded, including tools we have not classified:
+ * offloading an unknown tool the model needs immediately is a quality drop.
+ * Only consulted when OPENCODE_CLAUDE_DEFER_TOOLS=1.
+ */
+const DEFERRABLE_TOOLS = new Set(["webfetch", "websearch", "subagent"]);
+
+function looksLikeToolError(text: string): boolean {
+  const head = text.slice(0, 240);
+  return (
+    /^(Error:|error:|\[error\]|Tool error)/.test(head) ||
+    /"isError"\s*:\s*true/.test(head)
+  );
+}
+
+function envFlag(name: string): boolean {
+  const value = (process.env[name] ?? "").toLowerCase();
+  return value === "1" || value === "true" || value === "yes" || value === "on";
+}
+
+/**
+ * Volatile Claude Code sections (cwd, memory path, git status) stay out of
+ * the cached system prefix unless the operator opts back into the old layout.
+ */
+function excludeDynamicSections(): boolean {
+  const value = (process.env.OPENCODE_CLAUDE_DYNAMIC_SECTIONS ?? "").toLowerCase();
+  return !(value === "keep" || value === "1" || value === "true");
+}
+
+function deferToolsEnabled(): boolean {
+  return envFlag("OPENCODE_CLAUDE_DEFER_TOOLS");
 }
 
 /**

@@ -2,6 +2,7 @@
  * Build Claude Agent SDK prompts from OpenAI-compatible chat messages,
  * including text, images, and PDF/document attachments.
  */
+import { presentLargeOutput, spillThreshold } from "./spill.js";
 export type AnthropicContentBlock =
   | { type: "text"; text: string }
   | {
@@ -744,6 +745,9 @@ export type ConversationHistoryMessage = {
   }>;
   tool_call_id?: string;
   name?: string;
+  /** OpenAI-style reasoning echoed by the host. Kept on history transfer. */
+  reasoning_content?: unknown;
+  reasoning?: unknown;
 };
 
 /** Default history budget — generous on purpose ("keep it big"). */
@@ -766,6 +770,28 @@ function truncateMiddle(text: string, max: number): string {
   return `${head}\n… [${text.length - max} chars omitted] …\n${tail}`;
 }
 
+function reasoningFromMessage(msg: ConversationHistoryMessage): string {
+  const direct = [msg.reasoning_content, msg.reasoning]
+    .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+    .map((value) => value.trim());
+  const blocks: string[] = [];
+  if (Array.isArray(msg.content)) {
+    for (const part of msg.content) {
+      if (!part || typeof part !== "object") continue;
+      const block = part as { type?: string; thinking?: string; text?: string };
+      if (block.type === "thinking" && typeof block.thinking === "string") {
+        blocks.push(block.thinking.trim());
+      } else if (
+        (block.type === "reasoning" || block.type === "reasoning_content") &&
+        typeof block.text === "string"
+      ) {
+        blocks.push(block.text.trim());
+      }
+    }
+  }
+  return [...direct, ...blocks.filter(Boolean)].join("\n");
+}
+
 function serializeHistoryMessage(
   msg: ConversationHistoryMessage,
 ): string | null {
@@ -786,6 +812,8 @@ function serializeHistoryMessage(
     const parts: string[] = [];
     const text = extractTextContent(msg.content).trim();
     if (text) parts.push(text);
+    const reasoning = reasoningFromMessage(msg);
+    if (reasoning) parts.push(`[reasoning]\n${reasoning}`);
     for (const call of msg.tool_calls ?? []) {
       const name = call?.function?.name;
       if (name) parts.push(`[called tool: ${name}]`);
@@ -801,7 +829,13 @@ function serializeHistoryMessage(
       (typeof msg.name === "string" && msg.name) ||
       (typeof msg.tool_call_id === "string" && msg.tool_call_id) ||
       "tool";
-    return `Tool result (${label}):\n${truncateMiddle(text, TOOL_RESULT_MAX_CHARS)}`;
+    // Spilling is on by default. When it is disabled, keep the old middle
+    // truncation so a disabled spill does not inline the whole result.
+    const body =
+      spillThreshold() > 0
+        ? presentLargeOutput(text).text
+        : truncateMiddle(text, TOOL_RESULT_MAX_CHARS);
+    return `Tool result (${label}):\n${body}`;
   }
 
   return null;

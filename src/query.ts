@@ -135,7 +135,15 @@ export type StartClaudeQueryParams = {
   effort?: ClaudeEffort | string;
   systemPrompt?:
     | string
-    | { type: "preset"; preset: "claude_code"; append?: string };
+    | {
+        type: "preset";
+        preset: "claude_code";
+        append?: string;
+        /** Move cwd / memory / git status out of the cached system prefix. */
+        excludeDynamicSections?: boolean;
+        /** Record the system prompt once so later turns cannot rewrite it. */
+        snapshot?: boolean;
+      };
   canUseTool?: (
     toolName: string,
     input: Record<string, unknown>,
@@ -277,12 +285,25 @@ export async function startClaudeQuery(
       type: "preset";
       preset: "claude_code";
       append?: string;
+      excludeDynamicSections?: boolean;
+      snapshot?: boolean;
     } = { type: "preset", preset: "claude_code" };
     const append = trimmedString(presetSystemPrompt.append);
     if (append) systemPrompt.append = append;
+    if (presetSystemPrompt.excludeDynamicSections === true) {
+      systemPrompt.excludeDynamicSections = true;
+    }
+    if (presetSystemPrompt.snapshot === true) {
+      systemPrompt.snapshot = true;
+    }
     options.systemPrompt = systemPrompt;
   } else {
-    options.systemPrompt = { type: "preset", preset: "claude_code" };
+    options.systemPrompt = {
+      type: "preset",
+      preset: "claude_code",
+      snapshot: true,
+      excludeDynamicSections: true,
+    };
   }
 
   if (nonEmptyRecord(params.mcpServers)) options.mcpServers = params.mcpServers;
