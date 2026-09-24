@@ -4,6 +4,9 @@
  * Prefer `modelUsage` for totals (includes compact / auxiliary pipeline calls).
  * Fall back to per-turn `usage` (main agent loop only).
  */
+import { appendFileSync, mkdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 
 export type OpenAIUsage = {
   prompt_tokens: number;
@@ -168,6 +171,56 @@ export function usageFromAssistantEvent(event: unknown): OpenAIUsage | null {
   const usage = (message as Record<string, unknown>).usage;
   if (!usage || typeof usage !== "object") return null;
   return fromAnthropicUsage(usage as Record<string, unknown>);
+}
+
+export type UsageLogEntry = {
+  conversationKey: string;
+  model: string;
+  usage: OpenAIUsage | null;
+  toolCalls: number;
+  error?: string;
+};
+
+function usageLogEnabled(): boolean {
+  const value = (process.env.OPENCODE_CLAUDE_USAGE_LOG ?? "").toLowerCase();
+  return !(value === "0" || value === "false" || value === "no" || value === "off");
+}
+
+export function usageLogPath(): string {
+  const base = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
+  return join(base, "opencode-claude", "usage.jsonl");
+}
+
+/**
+ * Append one line per HTTP response with usage split by billing type.
+ * OpenCode's openai-compatible path drops cache-write tokens into plain
+ * input, so this file is the only place the split survives. Disable with
+ * OPENCODE_CLAUDE_USAGE_LOG=0.
+ */
+export function recordUsage(entry: UsageLogEntry): void {
+  if (!usageLogEnabled()) return;
+  const u = entry.usage;
+  const cacheRead = u?.prompt_tokens_details?.cached_tokens ?? 0;
+  const cacheWrite = u?.prompt_tokens_details?.cache_write_tokens ?? 0;
+  const line = {
+    ts: new Date().toISOString(),
+    conversationKey: entry.conversationKey,
+    model: entry.model,
+    input: u ? u.prompt_tokens - cacheRead - cacheWrite : 0,
+    cache_read: cacheRead,
+    cache_write: cacheWrite,
+    output: u?.completion_tokens ?? 0,
+    tool_calls: entry.toolCalls,
+    ...(u?.cost_usd !== undefined ? { cost_usd: u.cost_usd } : {}),
+    ...(entry.error ? { error: entry.error.slice(0, 200) } : {}),
+  };
+  try {
+    const path = usageLogPath();
+    mkdirSync(dirname(path), { recursive: true });
+    appendFileSync(path, `${JSON.stringify(line)}\n`, "utf8");
+  } catch {
+    // telemetry must never break a turn
+  }
 }
 
 /**
