@@ -75,7 +75,7 @@ import {
   type McpToolResultContent,
   type SdkUserPrompt,
 } from "./prompt.js";
-import { presentLargeOutput } from "./spill.js";
+import { presentLargeOutput, referencesSpillFile } from "./spill.js";
 import {
   detectMetaRequestKind,
   metaSystemPrompt,
@@ -724,7 +724,10 @@ async function handleChatCompletions(
     for (const [toolId, tool] of existing.pendingTools) {
       const result = toolResults.get(toolId);
       if (result !== undefined) {
-        const presented = presentToolResult(result);
+        // Reading a spill file back must not be spilled again.
+        const presented = presentToolResult(result, {
+          spill: !referencesSpillFile(tool.arguments),
+        });
         if (existing.accounting) {
           existing.accounting.spilledChars += presented.spilledChars;
           if (presented.error) existing.accounting.toolErrors.push(tool.name);
@@ -2172,14 +2175,19 @@ function forgetDeadSession(conversationKey: string, errorText: string): void {
 }
 
 /** Spill oversized text blocks of a tool result; media blocks pass through. */
-function presentToolResult(blocks: McpToolResultContent[]): {
+function presentToolResult(
+  blocks: McpToolResultContent[],
+  options: { spill: boolean },
+): {
   blocks: McpToolResultContent[];
   spilledChars: number;
   error: boolean;
 } {
   let spilledChars = 0;
+  // Error detection reads the original text, not a spill note.
   const first = blocks.find((b) => b.type === "text");
   const error = first?.type === "text" && looksLikeToolError(first.text);
+  if (!options.spill) return { blocks, spilledChars, error };
   const out = blocks.map((block) => {
     if (block.type !== "text") return block;
     const presented = presentLargeOutput(block.text);
