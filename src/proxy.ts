@@ -842,9 +842,27 @@ async function buildOpenCodeMcpServer(
       return undefined;
     }
 
+    // Full conversion keeps nested items, enums, required keys and argument
+    // descriptions. The flat fallback below turns nested arrays/objects into
+    // `any`, which left e.g. `question` without its required `header` /
+    // option `description` and produced recurring invalid-argument errors.
+    const fromJSONSchema = (z as { fromJSONSchema?: Function }).fromJSONSchema;
     const jsonSchemaToZodShape = (
       schema: Record<string, unknown> | undefined,
     ): Record<string, unknown> => {
+      if (typeof fromJSONSchema === "function" && schema?.type === "object") {
+        try {
+          const converted = fromJSONSchema(schema) as { shape?: unknown };
+          if (converted?.shape && typeof converted.shape === "object") {
+            return converted.shape as Record<string, unknown>;
+          }
+        } catch (err) {
+          log.warn(
+            "[opencode-claude] tool schema conversion failed; using flat schema",
+            err instanceof Error ? err.message : err,
+          );
+        }
+      }
       const props =
         schema &&
         typeof schema === "object" &&

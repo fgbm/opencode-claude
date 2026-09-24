@@ -1133,6 +1133,41 @@ async function main() {
                 parameters: { type: "object", properties: {} },
               },
             },
+            {
+              type: "function",
+              function: {
+                name: "question",
+                description: "Ask the user",
+                parameters: {
+                  type: "object",
+                  properties: {
+                    questions: {
+                      type: "array",
+                      items: {
+                        type: "object",
+                        properties: {
+                          question: { type: "string" },
+                          header: { type: "string", description: "Short label" },
+                          options: {
+                            type: "array",
+                            items: {
+                              type: "object",
+                              properties: {
+                                label: { type: "string" },
+                                description: { type: "string" },
+                              },
+                              required: ["label", "description"],
+                            },
+                          },
+                        },
+                        required: ["question", "header", "options"],
+                      },
+                    },
+                  },
+                  required: ["questions"],
+                },
+              },
+            },
           ],
           messages: [{ role: "user", content: "plan something" }],
         }),
@@ -1162,6 +1197,33 @@ async function main() {
       const sysPrompt = seenParams.systemPrompt as { append?: string };
       assert.match(sysPrompt.append ?? "", /mcp__opencode__todowrite/);
       assert.match(sysPrompt.append ?? "", /[Bb]atch independent tool calls/);
+
+      // Bridged tool schemas keep nested structure: Claude must see the
+      // required `header` / option `description` of `question`.
+      const bridged = (
+        seenParams as {
+          mcpServers?: {
+            opencode?: {
+              instance?: {
+                _registeredTools?: Record<string, { inputSchema?: unknown }>;
+              };
+            };
+          };
+        }
+      ).mcpServers?.opencode?.instance?._registeredTools?.question?.inputSchema;
+      assert.ok(bridged, "question tool bridged");
+      const { z: zod } = await import("zod");
+      const bridgedJson = JSON.stringify(
+        zod.toJSONSchema(bridged as Parameters<typeof zod.toJSONSchema>[0]),
+      );
+      assert.match(bridgedJson, /"required":\["question","header","options"\]/);
+      assert.match(bridgedJson, /"description":"Short label"/);
+      assert.equal(
+        (bridged as { safeParse: (v: unknown) => { success: boolean } }).safeParse({
+          questions: [{ question: "q", options: [{ label: "a" }] }],
+        }).success,
+        false,
+      );
 
       // Proxy + mock SDK: hard limit error BEFORE any content — the proxy
       // must answer with a truthful HTTP 429 (not a fake-200 error stream),
