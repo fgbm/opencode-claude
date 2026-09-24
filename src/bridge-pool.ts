@@ -12,11 +12,26 @@ export type ParkedToolCall = {
   reject: (error: Error) => void;
 };
 
+/** Harness-side sizes for the query that opened this bridge. Not tokens. */
+export type TurnAccounting = {
+  kind: string;
+  resumed: boolean;
+  historyChars: number;
+  toolSchemaChars: number;
+  systemAppendChars: number;
+  userChars: number;
+  toolsOffered: number;
+  spilledChars: number;
+  toolNames: string[];
+  toolErrors: string[];
+};
+
 export type ParkedBridge = {
   id: string;
   conversationKey: string;
   handle: ClaudeQueryHandle;
   pendingTools: Map<string, ParkedToolCall>;
+  accounting?: TurnAccounting;
   /** SDK assistant messages whose usage was already reported to OpenCode. */
   seenAssistantUsageIds: Set<string>;
   /** Output tokens already reported per SDK assistant message id. */

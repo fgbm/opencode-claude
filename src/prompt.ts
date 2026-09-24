@@ -2,6 +2,7 @@
  * Build Claude Agent SDK prompts from OpenAI-compatible chat messages,
  * including text, images, and PDF/document attachments.
  */
+import { presentLargeOutput, spillThreshold } from "./spill.js";
 export type AnthropicContentBlock =
   | { type: "text"; text: string }
   | {
@@ -450,7 +451,41 @@ export type ConversationHistoryMessage = {
   }>;
   tool_call_id?: string;
   name?: string;
+  /** OpenAI-style reasoning echoed by the host. Kept on history transfer. */
+  reasoning_content?: unknown;
+  reasoning?: unknown;
 };
+
+/**
+ * OpenCode-specific append to the Claude Code preset.
+ *
+ * `v1` is the historical text (default). `v2` is the same constraints in
+ * plain descriptions, with a byte-stable todo sentence so the cached prefix
+ * does not depend on whether todowrite was in the tool list. Select v2 with
+ * OPENCODE_CLAUDE_PROMPT_V2=1.
+ */
+export function openCodeSystemAppend(
+  toolNames: readonly string[],
+  variant: "v1" | "v2" = "v1",
+): string {
+  if (variant === "v2") {
+    return [
+      "You are running inside OpenCode. Built-in Claude Code tools are disabled. Use only the mcp__opencode__* tools provided for this turn; they execute via OpenCode.",
+      "Independent tool calls can be issued together in one turn.",
+      "When mcp__opencode__todowrite is available, multi-step work is tracked there. A plan that exists only in text is not restored on a later turn.",
+    ].join(" ");
+  }
+  const hasTodo = toolNames.includes("todowrite");
+  return [
+    "You are running inside OpenCode. Built-in Claude Code tools are disabled. Use only the mcp__opencode__* tools provided for this turn; they execute via OpenCode.",
+    "Batch independent tool calls into a single turn instead of calling them one at a time.",
+    ...(hasTodo
+      ? [
+          "For any multi-step work, ALWAYS write the plan with the mcp__opencode__todowrite tool and keep it updated as you progress. A plan that only exists in your text is lost when the session is restored or handed to another agent.",
+        ]
+      : []),
+  ].join(" ");
+}
 
 /** Default history budget — generous on purpose ("keep it big"). */
 const DEFAULT_HISTORY_MAX_CHARS = 400_000;
@@ -470,6 +505,28 @@ function truncateMiddle(text: string, max: number): string {
   const head = text.slice(0, Math.floor(max / 2));
   const tail = text.slice(text.length - Math.floor(max / 2));
   return `${head}\n… [${text.length - max} chars omitted] …\n${tail}`;
+}
+
+function reasoningFromMessage(msg: ConversationHistoryMessage): string {
+  const direct = [msg.reasoning_content, msg.reasoning]
+    .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+    .map((value) => value.trim());
+  const blocks: string[] = [];
+  if (Array.isArray(msg.content)) {
+    for (const part of msg.content) {
+      if (!part || typeof part !== "object") continue;
+      const block = part as { type?: string; thinking?: string; text?: string };
+      if (block.type === "thinking" && typeof block.thinking === "string") {
+        blocks.push(block.thinking.trim());
+      } else if (
+        (block.type === "reasoning" || block.type === "reasoning_content") &&
+        typeof block.text === "string"
+      ) {
+        blocks.push(block.text.trim());
+      }
+    }
+  }
+  return [...direct, ...blocks.filter(Boolean)].join("\n");
 }
 
 function serializeHistoryMessage(
@@ -492,6 +549,8 @@ function serializeHistoryMessage(
     const parts: string[] = [];
     const text = extractTextContent(msg.content).trim();
     if (text) parts.push(text);
+    const reasoning = reasoningFromMessage(msg);
+    if (reasoning) parts.push(`[reasoning]\n${reasoning}`);
     for (const call of msg.tool_calls ?? []) {
       const name = call?.function?.name;
       if (name) parts.push(`[called tool: ${name}]`);
@@ -507,7 +566,13 @@ function serializeHistoryMessage(
       (typeof msg.name === "string" && msg.name) ||
       (typeof msg.tool_call_id === "string" && msg.tool_call_id) ||
       "tool";
-    return `Tool result (${label}):\n${truncateMiddle(text, TOOL_RESULT_MAX_CHARS)}`;
+    // Spilling is on by default. When it is disabled, keep the old middle
+    // truncation so a disabled spill does not inline the whole result.
+    const body =
+      spillThreshold() > 0
+        ? presentLargeOutput(text).text
+        : truncateMiddle(text, TOOL_RESULT_MAX_CHARS);
+    return `Tool result (${label}):\n${body}`;
   }
 
   return null;
