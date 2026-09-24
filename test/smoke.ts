@@ -748,6 +748,15 @@ async function main() {
       openCodeSystemAppend(["todowrite", "read"], "v2"),
     );
 
+    const { referencesSpillFile } = await import("../src/spill.ts");
+    process.env.OPENCODE_CLAUDE_SPILL_DIR = spillDir;
+    assert.equal(
+      referencesSpillFile(JSON.stringify({ path: join(spillDir, "spill-abc.txt") })),
+      true,
+    );
+    assert.equal(referencesSpillFile(JSON.stringify({ path: "/tmp/other.txt" })), false);
+    delete process.env.OPENCODE_CLAUDE_SPILL_DIR;
+
     // spill disabled restores middle truncation
     process.env.OPENCODE_CLAUDE_SPILL_CHARS = "0";
     try {

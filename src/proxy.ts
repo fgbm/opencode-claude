@@ -65,7 +65,7 @@ import {
   withConversationContext,
   type SdkUserPrompt,
 } from "./prompt.js";
-import { presentLargeOutput } from "./spill.js";
+import { presentLargeOutput, referencesSpillFile } from "./spill.js";
 import {
   detectMetaRequestKind,
   metaSystemPrompt,
@@ -574,10 +574,12 @@ async function handleChatCompletions(
     for (const [toolId, tool] of existing.pendingTools) {
       const result = toolResults.get(toolId);
       if (result !== undefined) {
-        const presented = presentLargeOutput(result);
+        const presented = referencesSpillFile(tool.arguments)
+          ? { text: result, spilledChars: 0 }
+          : presentLargeOutput(result);
         if (existing.accounting) {
           existing.accounting.spilledChars += presented.spilledChars;
-          if (looksLikeToolError(presented.text)) {
+          if (looksLikeToolError(result)) {
             existing.accounting.toolErrors.push(tool.name);
           }
         }

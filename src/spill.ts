@@ -28,6 +28,16 @@ export function spillDirectory(): string {
   return join(base, "opencode-claude", "spills");
 }
 
+/**
+ * True when a tool call is fetching a file this harness already spilled.
+ * Spilling that result again hides the middle the model just asked for.
+ */
+export function referencesSpillFile(argumentsJson: string): boolean {
+  if (!argumentsJson) return false;
+  const dir = spillDirectory();
+  return argumentsJson.includes(dir) || argumentsJson.includes("opencode-claude/spills/");
+}
+
 export type PresentedOutput = {
   text: string;
   spilledChars: number;
@@ -68,6 +78,7 @@ export function presentLargeOutput(
       text.slice(-SPILL_TAIL),
       "Read the file only if the omitted middle matters.",
     ].join("\n");
+    if (note.length >= text.length) return { text, spilledChars: 0 };
     return { text: note, spilledChars: text.length - note.length };
   } catch (err) {
     log.warn(
