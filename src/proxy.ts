@@ -71,6 +71,7 @@ import {
   formatCompactNote,
   resolveTurnUsage,
   settleOutputTokens,
+  recordUsage,
   usageFromAssistantEvent,
   usageFromSdkResult,
   type OpenAIUsage,
@@ -1030,6 +1031,15 @@ async function collectTurnResponse(
   }
 
   const usage = resolveTurnUsage(turnUsage, resultUsage);
+  recordUsage({
+    conversationKey: bridge.conversationKey,
+    model,
+    usage,
+    toolCalls: toolCalls.length,
+    ...(errorText ? { error: errorText } : {}),
+  });
+
+
   // Buffered responses have not committed HTTP headers yet. Even if an agent
   // produced partial work first, preserve the real 429 so OpenCode starts its
   // retry countdown instead of treating the run as a successful answer.
@@ -1304,6 +1314,8 @@ function streamOpenAIResponse(
       });
 
       let finishReason: string | null = "stop";
+      let streamedToolCalls = 0;
+      let streamError: string | null = null;
       let turnUsage: OpenAIUsage | null = null;
       let resultUsage: OpenAIUsage | null = null;
       let lastErrorNorm: string | null = null;
@@ -1311,6 +1323,7 @@ function streamOpenAIResponse(
         const norm = normalizeClaudeErrorText(text);
         if (!norm || norm === lastErrorNorm) return;
         lastErrorNorm = norm;
+        streamError = text;
         if (classifyClaudeFailure(text) === "rate_limit") {
           // The HTTP head is already committed after earlier agent output, so
           // a late 429 is impossible. Send an OpenAI-compatible stream error.
@@ -1353,6 +1366,7 @@ function streamOpenAIResponse(
           const mapped = mapSdkEvent(event);
           if (mapped.kind === "park") {
             finishReason = "tool_calls";
+            streamedToolCalls += mapped.tools.length;
             for (let i = 0; i < mapped.tools.length; i++) {
               const tool = mapped.tools[i];
               send({
@@ -1472,6 +1486,13 @@ function streamOpenAIResponse(
       }
 
       const usage = resolveTurnUsage(turnUsage, resultUsage);
+      recordUsage({
+        conversationKey: bridge.conversationKey,
+        model,
+        usage,
+        toolCalls: streamedToolCalls,
+        ...(streamError ? { error: streamError } : {}),
+      });
       if (!streamClosed) {
         send({
           id: completionId,

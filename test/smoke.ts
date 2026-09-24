@@ -6,6 +6,8 @@ import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 
 async function main() {
+  // Mock turns must not append to the operator's real usage log.
+  process.env.OPENCODE_CLAUDE_USAGE_LOG = "0";
   const { buildClaudeCodeChildEnv } = await import("../src/auth-env.ts");
   const {
     interpretClaudeAuthStatus,
@@ -687,6 +689,35 @@ async function main() {
     assert.equal(acc!.completion_tokens, 700);
     assert.equal(acc!.total_tokens, 1730);
     assert.equal(acc!.prompt_tokens_details?.cached_tokens, 900);
+  }
+
+  // Usage log: one JSON line per response, split by billing type.
+  {
+    const { recordUsage, usageLogPath } = await import("../src/usage.ts");
+    const { mkdtempSync, readFileSync: readUsage, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join: joinPath } = await import("node:path");
+    const dir = mkdtempSync(joinPath(tmpdir(), "occ-usage-"));
+    const prevXdg = process.env.XDG_DATA_HOME;
+    process.env.XDG_DATA_HOME = dir;
+    process.env.OPENCODE_CLAUDE_USAGE_LOG = "1";
+    try {
+      recordUsage({ conversationKey: "k", model: "opus", usage: callUsage, toolCalls: 2 });
+      const line = JSON.parse(readUsage(usageLogPath(), "utf8").trim());
+      assert.equal(line.input, 100);
+      assert.equal(line.cache_read, 900);
+      assert.equal(line.cache_write, 30);
+      assert.equal(line.output, 20);
+      assert.equal(line.tool_calls, 2);
+      process.env.OPENCODE_CLAUDE_USAGE_LOG = "0";
+      recordUsage({ conversationKey: "k", model: "opus", usage: callUsage, toolCalls: 0 });
+      assert.equal(readUsage(usageLogPath(), "utf8").trim().split("\n").length, 1);
+    } finally {
+      if (prevXdg === undefined) delete process.env.XDG_DATA_HOME;
+      else process.env.XDG_DATA_HOME = prevXdg;
+      process.env.OPENCODE_CLAUDE_USAGE_LOG = "0";
+      rmSync(dir, { recursive: true, force: true });
+    }
   }
 
   // Accumulated per-response usage wins over the cumulative result snapshot

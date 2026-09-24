@@ -169,6 +169,7 @@ Optional knobs:
 - `OPENCODE_CLAUDE_RATE_LIMIT_FAST_FAIL` — `0` disables the 429 rate-limit gate
 - `OPENCODE_CLAUDE_RATE_LIMIT_STORE` — override the rate-limit store path (tests)
 - `OPENCODE_CLAUDE_HISTORY_MAX_CHARS` — budget for transferred conversation history when a Claude session cannot be resumed (default `400000`; newest messages are kept, `0` disables transfer)
+- `OPENCODE_CLAUDE_USAGE_LOG` — `0` disables `~/.local/share/opencode-claude/usage.jsonl`, one line per response with input / cache_read / cache_write / output tokens (OpenCode itself folds cache writes into input)
 
 ## Troubleshooting
 
