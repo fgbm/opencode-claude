@@ -19,6 +19,10 @@ export type ParkedBridge = {
   pendingTools: Map<string, ParkedToolCall>;
   /** SDK assistant messages whose usage was already reported to OpenCode. */
   seenAssistantUsageIds: Set<string>;
+  /** Output tokens already reported per SDK assistant message id. */
+  outputTokensById: Map<string, number>;
+  /** Id of the API call currently streaming (from `message_start`). */
+  streamMessageId: string | null;
   createdAt: number;
   /** Continues consuming the SDK stream after tools resolve. */
   continueStream?: () => AsyncGenerator<unknown, void, unknown>;

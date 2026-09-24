@@ -67,9 +67,10 @@ import {
   requestKeyNamespace,
 } from "./request-kind.js";
 import {
-  addUniqueAssistantUsage,
+  addAssistantUsageSnapshot,
   formatCompactNote,
   resolveTurnUsage,
+  settleOutputTokens,
   usageFromAssistantEvent,
   usageFromSdkResult,
   type OpenAIUsage,
@@ -682,6 +683,8 @@ async function handleChatCompletions(
     handle,
     pendingTools,
     seenAssistantUsageIds: new Set(),
+    outputTokensById: new Map(),
+    streamMessageId: null,
     createdAt: Date.now(),
   };
   putBridge(bridge);
@@ -975,11 +978,21 @@ async function collectTurnResponse(
       } else if (mapped.kind === "reasoning") {
         if (!suppressReasoning) reasoning += mapped.text;
       } else if (mapped.kind === "usage-delta") {
-        turnUsage = addUniqueAssistantUsage(
+        turnUsage = addAssistantUsageSnapshot(
           turnUsage,
           mapped.usage,
           mapped.messageId,
           bridge.seenAssistantUsageIds,
+          bridge.outputTokensById,
+        );
+      } else if (mapped.kind === "message-start") {
+        bridge.streamMessageId = mapped.messageId;
+      } else if (mapped.kind === "output-final") {
+        turnUsage = settleOutputTokens(
+          turnUsage,
+          bridge.streamMessageId,
+          mapped.outputTokens,
+          bridge.outputTokensById,
         );
       } else if (mapped.kind === "usage") {
         resultUsage = mapped.usage;
@@ -999,7 +1012,6 @@ async function collectTurnResponse(
   }
 
   const usage = resolveTurnUsage(turnUsage, resultUsage);
-
   // Buffered responses have not committed HTTP headers yet. Even if an agent
   // produced partial work first, preserve the real 429 so OpenCode starts its
   // retry countdown instead of treating the run as a successful answer.
@@ -1388,11 +1400,25 @@ function streamOpenAIResponse(
           }
 
           if (mapped.kind === "usage-delta") {
-            turnUsage = addUniqueAssistantUsage(
+            turnUsage = addAssistantUsageSnapshot(
               turnUsage,
               mapped.usage,
               mapped.messageId,
               bridge.seenAssistantUsageIds,
+              bridge.outputTokensById,
+            );
+          }
+
+          if (mapped.kind === "message-start") {
+            bridge.streamMessageId = mapped.messageId;
+          }
+
+          if (mapped.kind === "output-final") {
+            turnUsage = settleOutputTokens(
+              turnUsage,
+              bridge.streamMessageId,
+              mapped.outputTokens,
+              bridge.outputTokensById,
             );
           }
 
@@ -1468,6 +1494,8 @@ type MappedEvent =
   | { kind: "park"; tools: ParkedToolCall[] }
   | { kind: "usage"; usage: OpenAIUsage }
   | { kind: "usage-delta"; usage: OpenAIUsage; messageId: string | null }
+  | { kind: "message-start"; messageId: string | null }
+  | { kind: "output-final"; outputTokens: number }
   | { kind: "error"; text: string; usage?: OpenAIUsage | null }
   | { kind: "ignore" };
 
@@ -1552,6 +1580,28 @@ function mapSdkEvent(event: unknown): MappedEvent {
   // stream_event / partial message deltas (authoritative while streaming)
   if (e.type === "stream_event" && e.event && typeof e.event === "object") {
     const ev = e.event as Record<string, unknown>;
+    // message_start names the API call; message_delta carries its final
+    // cumulative output_tokens (assistant events only have early snapshots).
+    if (ev.type === "message_start") {
+      const message =
+        ev.message && typeof ev.message === "object"
+          ? (ev.message as Record<string, unknown>)
+          : null;
+      return {
+        kind: "message-start",
+        messageId: typeof message?.id === "string" ? message.id : null,
+      };
+    }
+    if (ev.type === "message_delta") {
+      const usage =
+        ev.usage && typeof ev.usage === "object"
+          ? (ev.usage as Record<string, unknown>)
+          : null;
+      const output = usage?.output_tokens;
+      return typeof output === "number" && Number.isFinite(output) && output > 0
+        ? { kind: "output-final", outputTokens: output }
+        : { kind: "ignore" };
+    }
     if (ev.type === "content_block_delta" && ev.delta && typeof ev.delta === "object") {
       const delta = ev.delta as Record<string, unknown>;
       if (delta.type === "text_delta" && typeof delta.text === "string") {

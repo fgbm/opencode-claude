@@ -659,6 +659,36 @@ async function main() {
   );
   assert.equal(secondUnique?.total_tokens, callUsage!.total_tokens * 2);
 
+  // Assistant events carry an early output snapshot; message_delta carries
+  // the final count. Either order yields prompt once + final output once.
+  const { addAssistantUsageSnapshot, settleOutputTokens } = await import(
+    "../src/usage.ts"
+  );
+  for (const finalFirst of [false, true]) {
+    const seen = new Set<string>();
+    const outputById = new Map<string, number>();
+    let acc: ReturnType<typeof addOpenAIUsage> | null = null;
+    const snapshot = () => {
+      acc = addAssistantUsageSnapshot(acc, callUsage!, "m", seen, outputById);
+    };
+    const final = () => {
+      acc = settleOutputTokens(acc, "m", 700, outputById);
+    };
+    if (finalFirst) {
+      final();
+      snapshot();
+      snapshot();
+    } else {
+      snapshot();
+      snapshot();
+      final();
+    }
+    assert.equal(acc!.prompt_tokens, 1030);
+    assert.equal(acc!.completion_tokens, 700);
+    assert.equal(acc!.total_tokens, 1730);
+    assert.equal(acc!.prompt_tokens_details?.cached_tokens, 900);
+  }
+
   // Accumulated per-response usage wins over the cumulative result snapshot
   // (which would double-count prior turns of a continued Claude query), but
   // inherits cost/model breakdown metadata from it.

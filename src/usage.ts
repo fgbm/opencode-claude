@@ -211,6 +211,59 @@ export function addUniqueAssistantUsage(
 }
 
 /**
+ * Raise one API call's counted output tokens to `outputTokens`.
+ *
+ * `assistant` events are emitted per content block while the call is still
+ * streaming, so their `output_tokens` is an early snapshot (often single
+ * digits). The final cumulative count arrives in the `message_delta` stream
+ * event. Counting per message id with max-merge makes the result independent
+ * of which of the two arrives first.
+ */
+export function settleOutputTokens(
+  acc: OpenAIUsage | null,
+  messageId: string | null,
+  outputTokens: number,
+  counted: Map<string, number>,
+): OpenAIUsage | null {
+  if (!messageId || !(outputTokens > 0)) return acc;
+  const prev = counted.get(messageId) ?? 0;
+  if (outputTokens <= prev) return acc;
+  counted.set(messageId, outputTokens);
+  const add = outputTokens - prev;
+  return addOpenAIUsage(acc, {
+    prompt_tokens: 0,
+    completion_tokens: add,
+    total_tokens: add,
+  });
+}
+
+/**
+ * Count an `assistant` event's usage: prompt/cache tokens once per message
+ * id, output tokens via {@link settleOutputTokens}.
+ */
+export function addAssistantUsageSnapshot(
+  acc: OpenAIUsage | null,
+  delta: OpenAIUsage,
+  messageId: string | null,
+  seen: Set<string>,
+  outputById: Map<string, number>,
+): OpenAIUsage | null {
+  if (!messageId) return addOpenAIUsage(acc, delta);
+  const promptOnly: OpenAIUsage = {
+    ...delta,
+    completion_tokens: 0,
+    total_tokens: delta.prompt_tokens,
+  };
+  const withPrompt = addUniqueAssistantUsage(acc, promptOnly, messageId, seen);
+  return settleOutputTokens(
+    withPrompt,
+    messageId,
+    delta.completion_tokens,
+    outputById,
+  );
+}
+
+/**
  * Combine the per-response accumulated usage (one entry per Anthropic API
  * call seen during this HTTP response) with the SDK `result` snapshot.
  *
