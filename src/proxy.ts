@@ -151,8 +151,25 @@ type ChatCompletionRequest = {
   temperature?: number;
 };
 
-let server: ReturnType<typeof Bun.serve> | null = null;
-let proxyPort: number | null = null;
+/**
+ * OpenCode 2 instantiates the plugin once per location, so module-level state
+ * is not process-wide: every instance used to bind its own listener (one proxy
+ * per project/chat, ~30 listeners in a busy server). The runtime below lives on
+ * `globalThis`, so all instances in the same process share a single proxy.
+ */
+type ProxyRuntime = {
+  server: ReturnType<typeof Bun.serve> | null;
+  port: number | null;
+};
+
+const SHARED_PROXY_KEY = Symbol.for("opencode-claude.proxy.runtime");
+
+function sharedProxyRuntime(): ProxyRuntime {
+  const store = globalThis as typeof globalThis & {
+    [SHARED_PROXY_KEY]?: ProxyRuntime;
+  };
+  return (store[SHARED_PROXY_KEY] ??= { server: null, port: null });
+}
 
 /** Injectable for smoke tests — production path always uses startClaudeQuery. */
 let queryStarter: typeof startClaudeQuery = startClaudeQuery;
@@ -164,7 +181,8 @@ export function setClaudeQueryStarter(
 }
 
 export function getClaudeProxyBaseUrl(): string {
-  const port = proxyPort ?? (REQUESTED_PROXY_PORT > 0 ? REQUESTED_PROXY_PORT : null);
+  const port =
+    sharedProxyRuntime().port ?? (REQUESTED_PROXY_PORT > 0 ? REQUESTED_PROXY_PORT : null);
   if (!port) {
     throw new Error(
       "Claude proxy is not listening yet — call startProxy() before getClaudeProxyBaseUrl()",
@@ -174,7 +192,7 @@ export function getClaudeProxyBaseUrl(): string {
 }
 
 export function getProxyPort(): number | null {
-  return proxyPort;
+  return sharedProxyRuntime().port;
 }
 
 function isAddrInUseError(err: unknown): boolean {
@@ -215,15 +233,16 @@ async function isProxyHealthyAt(baseUrl: string): Promise<boolean> {
 }
 
 export async function startProxy(): Promise<number> {
-  if (server && proxyPort) return proxyPort;
+  const runtime = sharedProxyRuntime();
+  if (runtime.server && runtime.port) return runtime.port;
 
   // Only reuse a sibling listener when the operator pinned a port.
   if (REQUESTED_PROXY_PORT > 0) {
     const pinnedUrl = `http://127.0.0.1:${REQUESTED_PROXY_PORT}/v1`;
     if (await isProxyHealthyAt(pinnedUrl)) {
-      proxyPort = REQUESTED_PROXY_PORT;
+      runtime.port = REQUESTED_PROXY_PORT;
       log.info(`[opencode-claude] reusing healthy proxy on ${pinnedUrl}`);
-      return proxyPort;
+      return runtime.port;
     }
   }
 
@@ -231,7 +250,7 @@ export async function startProxy(): Promise<number> {
   const bindPort = REQUESTED_PROXY_PORT; // 0 → ephemeral
 
   try {
-    server = Bun.serve({
+    const server = Bun.serve({
       hostname,
       port: bindPort,
       idleTimeout: PROXY_IDLE_TIMEOUT_SECONDS,
@@ -239,33 +258,40 @@ export async function startProxy(): Promise<number> {
         return handleRequest(req);
       },
     });
-    proxyPort = server.port ?? null;
-    if (!proxyPort) {
+    runtime.server = server;
+    runtime.port = server.port ?? null;
+    if (!runtime.port) {
       throw new Error("Failed to bind Claude proxy to a port");
     }
     log.info(`[opencode-claude] proxy listening on ${getClaudeProxyBaseUrl()}`);
-    return proxyPort;
+    return runtime.port;
   } catch (err) {
     if (
       REQUESTED_PROXY_PORT > 0 &&
       isAddrInUseError(err) &&
       (await isProxyHealthyAt(`http://127.0.0.1:${REQUESTED_PROXY_PORT}/v1`))
     ) {
-      proxyPort = REQUESTED_PROXY_PORT;
+      runtime.port = REQUESTED_PROXY_PORT;
       log.info(
         `[opencode-claude] port ${REQUESTED_PROXY_PORT} in use; reusing existing proxy`,
       );
-      return proxyPort;
+      return runtime.port;
     }
     throw err;
   }
 }
 
+/**
+ * Stop the process-wide proxy. Used by tests and explicit teardown; the plugin
+ * instance lifecycle must NOT call this — unloading one location would kill the
+ * listener that every other location is using.
+ */
 export async function stopProxy(): Promise<void> {
-  if (server) {
-    server.stop(true);
-    server = null;
-    proxyPort = null;
+  const runtime = sharedProxyRuntime();
+  if (runtime.server) {
+    runtime.server.stop(true);
+    runtime.server = null;
+    runtime.port = null;
   }
 }
 

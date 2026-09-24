@@ -40,11 +40,7 @@ import {
   type SdkModelRow,
 } from "./models.js";
 import { listClaudeSupportedModels } from "./query.js";
-import {
-  getClaudeProxyBaseUrl,
-  startProxy,
-  stopProxy,
-} from "./proxy.js";
+import { getClaudeProxyBaseUrl, startProxy } from "./proxy.js";
 
 export function applyClaudeRequestContextHeaders(
   headers: Record<string, string>,
@@ -213,7 +209,8 @@ export const ClaudeCodePlugin: Plugin.Plugin = {
       });
     });
 
-    return () => stopProxy();
+    // No cleanup: the proxy lives for the whole server process, so unloading
+    // one location never interrupts Claude turns running in another.
   },
 };
 
