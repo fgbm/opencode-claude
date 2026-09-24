@@ -154,6 +154,8 @@ export type StartClaudeQueryParams = {
   disallowedTools?: string[];
   skills?: string[] | "all";
   settingSources?: Array<"user" | "project" | "local">;
+  /** Ignore .mcp.json, user settings and claude.ai MCP; use only `mcpServers`. */
+  strictMcpConfig?: boolean;
   pathToClaudeCodeExecutable?: string;
   /** Required when permissionMode is bypassPermissions. */
   allowDangerouslySkipPermissions?: boolean;
@@ -271,6 +273,7 @@ export async function startClaudeQuery(
   }
 
   if (nonEmptyRecord(params.mcpServers)) options.mcpServers = params.mcpServers;
+  if (params.strictMcpConfig === true) options.strictMcpConfig = true;
   if (nonEmptyRecord(params.agents)) options.agents = params.agents;
 
   const mainAgent = trimmedString(params.agent);

@@ -576,6 +576,11 @@ async function handleChatCompletions(
       : undefined;
 
   const bridgeOpenCodeTools = !isMetaRequest && openCodeTools.length > 0;
+  // Opt-in: the CLI otherwise also loads .mcp.json, ~/.claude.json and
+  // claude.ai connector servers, duplicating MCP servers OpenCode already
+  // exposes and resending their schemas on every request.
+  const strictMcp = bridgeOpenCodeTools && strictMcpEnabled();
+  if (strictMcp) env.ENABLE_CLAUDEAI_MCP_SERVERS = "false";
   const openCodeToolNames = openCodeTools
     .map((t) => t.function?.name)
     .filter((n): n is string => typeof n === "string" && n.length > 0);
@@ -635,6 +640,7 @@ async function handleChatCompletions(
     effort: selection.effort,
     env,
     mcpServers: isMetaRequest ? undefined : mcpServers,
+    ...(strictMcp ? { strictMcpConfig: true } : {}),
     autoCompactEnabled: !isMetaRequest,
     maxTurns: isMetaRequest ? 1 : undefined,
     thinking: isMetaRequest ? { type: "disabled" } : undefined,
@@ -1573,6 +1579,11 @@ function forgetDeadSession(conversationKey: string, errorText: string): void {
     conversationKey,
   });
   clearForeignSessionId(conversationKey);
+}
+
+function strictMcpEnabled(): boolean {
+  const value = (process.env.OPENCODE_CLAUDE_STRICT_MCP ?? "").toLowerCase();
+  return value === "1" || value === "true" || value === "yes" || value === "on";
 }
 
 /**

@@ -1089,6 +1089,7 @@ async function main() {
       // todowrite alias + plan-persistence prompt reach the query starter.
       __resetRateLimitNoteDedupe();
       let seenParams: Record<string, unknown> | null = null;
+      process.env.OPENCODE_CLAUDE_STRICT_MCP = "1";
       setClaudeQueryStarter(async (params) => {
         seenParams = params as unknown as Record<string, unknown>;
         const events = [
@@ -1221,6 +1222,15 @@ async function main() {
       // Query starter received the todo alias + plan-persistence append
       assert.ok(seenParams, "query starter params captured");
       assert.equal(seenParams.cwd, "/data/projects/infra");
+      // OPENCODE_CLAUDE_STRICT_MCP: only the bridged OpenCode server, no
+      // .mcp.json / user / claude.ai connector servers.
+      delete process.env.OPENCODE_CLAUDE_STRICT_MCP;
+      assert.equal(seenParams.strictMcpConfig, true);
+      assert.equal(
+        (seenParams.env as Record<string, string | undefined>)
+          .ENABLE_CLAUDEAI_MCP_SERVERS,
+        "false",
+      );
       const aliases = (seenParams as { toolAliases?: Record<string, string> })
         .toolAliases;
       assert.equal(aliases?.TodoWrite, "mcp__opencode__todowrite");
