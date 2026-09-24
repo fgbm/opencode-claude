@@ -54,7 +54,8 @@ async function main() {
       { method: "tools/list", params: {} },
       mcpExtra,
     );
-    assert.equal(listed.tools[0].description, fitted);
+    const subagent = listed.tools.find((t: { name: string }) => t.name === "subagent");
+    assert.equal(subagent.description, fitted);
     assert.equal(servers.opencode.instance._registeredTools.subagent.description, fitted);
   }
   const long = "x".repeat(CLAUDE_TOOL_DESCRIPTION_LIMIT + 10);
