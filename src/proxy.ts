@@ -65,7 +65,13 @@ import {
   withConversationContext,
   type SdkUserPrompt,
 } from "./prompt.js";
-import { presentLargeOutput, referencesSpillFile } from "./spill.js";
+import { presentToolResult } from "./spill.js";
+import {
+  MAX_SLICE_CHARS,
+  formatSlice,
+  outputStoreEnabled,
+  sharedOutputStore,
+} from "./output-store.js";
 import {
   detectMetaRequestKind,
   metaSystemPrompt,
@@ -574,9 +580,11 @@ async function handleChatCompletions(
     for (const [toolId, tool] of existing.pendingTools) {
       const result = toolResults.get(toolId);
       if (result !== undefined) {
-        const presented = referencesSpillFile(tool.arguments)
-          ? { text: result, spilledChars: 0 }
-          : presentLargeOutput(result);
+        const presented = presentToolResult(
+          tool.name,
+          result,
+          outputStoreEnabled() ? sharedOutputStore() : undefined,
+        );
         if (existing.accounting) {
           existing.accounting.spilledChars += presented.spilledChars;
           if (looksLikeToolError(result)) {
@@ -781,6 +789,10 @@ async function handleChatCompletions(
   const openCodeToolNames = openCodeTools
     .map((t) => t.function?.name)
     .filter((n): n is string => typeof n === "string" && n.length > 0);
+  // Answered inside this process from the in-memory output store; OpenCode
+  // never sees these calls.
+  const localToolNames =
+    bridgeOpenCodeTools && withOutputSlice(openCodeToolNames) ? [OUTPUT_SLICE_TOOL] : [];
   const toolAliases = bridgeOpenCodeTools
     ? Object.fromEntries(
         openCodeToolNames.flatMap((name) => {
@@ -863,7 +875,7 @@ async function handleChatCompletions(
     tools: isMetaRequest || bridgeOpenCodeTools ? [] : undefined,
     toolAliases,
     allowedTools: bridgeOpenCodeTools
-      ? openCodeToolNames.map((n) => `mcp__opencode__${n}`)
+      ? [...openCodeToolNames, ...localToolNames].map((n) => `mcp__opencode__${n}`)
       : undefined,
     permissionMode: isMetaRequest
       ? "dontAsk"
@@ -1064,6 +1076,14 @@ function extractSessionId(event: unknown): string | null {
   return null;
 }
 
+const OUTPUT_SLICE_TOOL = "output_slice";
+
+/** The local tool is offered only when the store is on and no OpenCode tool owns the name. */
+function withOutputSlice(openCodeToolNames: readonly string[]): boolean {
+  return outputStoreEnabled() && !openCodeToolNames.includes(OUTPUT_SLICE_TOOL);
+}
+
+
 /** OpenCode tool parameters as an MCP-valid object schema. */
 export function normalizeToolParameters(
   parameters: unknown,
@@ -1200,6 +1220,60 @@ export async function buildOpenCodeMcpServer(
         );
       })
       .filter(Boolean);
+
+    const toolNames = tools
+      .map((t) => t.function?.name)
+      .filter((n): n is string => typeof n === "string" && n.length > 0);
+    if (withOutputSlice(toolNames)) {
+      const sliceDescription = `Read part of a tool output that was cut before reaching you. Pass the "output id" from the cut note. Returns up to ${MAX_SLICE_CHARS} chars starting at offset. Outputs are kept in memory for about 30 minutes.`;
+      const sliceShape = {
+        id: z.string().describe("The output id from the cut note, e.g. o1a2b3c4d5e6f"),
+        offset: z.number().int().min(0).optional().describe("First char to return (default 0)"),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(MAX_SLICE_CHARS)
+          .optional()
+          .describe(`Chars to return (default and max ${MAX_SLICE_CHARS})`),
+      };
+      const { $schema: _schema, ...sliceSchema } = z.toJSONSchema(
+        z.object(sliceShape),
+      ) as Record<string, unknown>;
+      listed.push({
+        name: OUTPUT_SLICE_TOOL,
+        description: sliceDescription,
+        inputSchema: stableSchema(sliceSchema) as Record<string, unknown>,
+        _meta: { "anthropic/alwaysLoad": true },
+      });
+      mcpTools.push(
+        toolFactory(
+          OUTPUT_SLICE_TOOL,
+          sliceDescription,
+          sliceShape,
+          async (args: { id: string; offset?: number; limit?: number }) => {
+            const result = sharedOutputStore().slice(args.id, args.offset, args.limit);
+            log.info("[opencode-claude] output_slice", {
+              id: args.id,
+              offset: args.offset ?? 0,
+              ok: result.ok,
+            });
+            return {
+              content: [{ type: "text", text: formatSlice(args.id, result) }],
+              ...(result.ok ? {} : { isError: true }),
+            };
+          },
+          { alwaysLoad: true },
+        ),
+      );
+    }
+    // Registration order is part of the cached prompt prefix; keep it sorted.
+    mcpTools.sort((x, y) => {
+      const a = (x as { name: string }).name;
+      const b = (y as { name: string }).name;
+      return a < b ? -1 : a > b ? 1 : 0;
+    });
+    listed.sort((x, y) => (x.name < y.name ? -1 : x.name > y.name ? 1 : 0));
 
     const server = createSdkMcpServer({
       name: "opencode",
