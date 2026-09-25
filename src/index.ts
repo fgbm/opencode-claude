@@ -13,7 +13,6 @@
 // needs none of OpenCode's runtime packages.
 import type { Model, Plugin, Provider } from "@opencode/plugin";
 import {
-  DEFAULT_MODEL_ID,
   DIRECTORY_HEADER,
   EFFORT_HEADER,
   KIND_HEADER,
@@ -67,10 +66,7 @@ export function buildProviderModel(model: ClaudeModel, id: string): ModelInfo {
     id,
     modelID: id,
     providerID: PROVIDER_ID,
-    name:
-      id === DEFAULT_MODEL_ID && model.id !== DEFAULT_MODEL_ID
-        ? `Default (${model.name})`
-        : model.name,
+    name: model.name,
     capabilities: {
       tools: true,
       input: ["text", "image", "pdf"],
@@ -88,13 +84,7 @@ export function buildProviderModel(model: ClaudeModel, id: string): ModelInfo {
 }
 
 export function buildClaudeProviderModels(models: ClaudeModel[]): ModelInfo[] {
-  const list = models.map((model) => buildProviderModel(model, model.id));
-  const defaultModel =
-    models.find((m) => m.id === DEFAULT_MODEL_ID) || models[0];
-  if (defaultModel && !models.some((m) => m.id === DEFAULT_MODEL_ID)) {
-    list.push(buildProviderModel(defaultModel, DEFAULT_MODEL_ID));
-  }
-  return list;
+  return models.map((model) => buildProviderModel(model, model.id));
 }
 
 export function buildProviderInfo(baseURL: string): ProviderInfo {

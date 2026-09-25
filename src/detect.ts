@@ -1,9 +1,8 @@
 /**
  * Claude CLI detection + Agent SDK probe (from OpenChamber harness).
  */
-import { spawnSync } from "node:child_process";
 import { buildClaudeCodeChildEnv } from "./auth-env.js";
-import { resolveClaudeCli } from "./executable-path.js";
+import { resolveClaudeCli, runCliProbe } from "./executable-path.js";
 import { probeClaudeAgentSdk } from "./query.js";
 
 export type ClaudeDetectStatus =
@@ -65,46 +64,44 @@ export function interpretClaudeAuthStatus(payload: unknown): {
   };
 }
 
-export function probeClaudeAuthStatusCli(options: {
+/**
+ * `claude auth status --json`, spawned asynchronously: it runs before every
+ * turn (through checkSubscriptionAuth) inside the OpenCode server, where a
+ * synchronous spawn would freeze every stream and health check meanwhile.
+ */
+export async function probeClaudeAuthStatusCli(options: {
   binaryPath: string;
   env?: NodeJS.ProcessEnv | Record<string, string | undefined>;
-  spawnSyncFn?: typeof spawnSync;
-}): { loggedIn: boolean; detail: string; authMethod?: string } | null {
+}): Promise<{ loggedIn: boolean; detail: string; authMethod?: string } | null> {
   const binaryPath = options.binaryPath.trim();
   if (!binaryPath) return null;
-  const spawnSyncFn = options.spawnSyncFn || spawnSync;
 
+  const result = await runCliProbe(binaryPath, ["auth", "status", "--json"], {
+    env: buildClaudeCodeChildEnv(options.env || process.env),
+    timeoutMs: 6000,
+  });
+  if (result.failed && !result.stdout.trim()) return null;
+
+  const output = result.stdout.trim();
+  if (!output) return { loggedIn: false, detail: "auth-status-empty" };
+
+  let payload: unknown;
   try {
-    const result = spawnSyncFn(binaryPath, ["auth", "status", "--json"], {
-      encoding: "utf8",
-      timeout: 6000,
-      env: buildClaudeCodeChildEnv(options.env || process.env) as NodeJS.ProcessEnv,
-      windowsHide: true,
-    });
-
-    const output = `${result.stdout || ""}`.trim();
-    if (!output) return { loggedIn: false, detail: "auth-status-empty" };
-
-    let payload: unknown;
-    try {
-      payload = JSON.parse(output);
-    } catch {
-      const start = output.indexOf("{");
-      const end = output.lastIndexOf("}");
-      if (start < 0 || end <= start) {
-        return { loggedIn: false, detail: "auth-status-parse-error" };
-      }
-      try {
-        payload = JSON.parse(output.slice(start, end + 1));
-      } catch {
-        return { loggedIn: false, detail: "auth-status-parse-error" };
-      }
-    }
-
-    return interpretClaudeAuthStatus(payload);
+    payload = JSON.parse(output);
   } catch {
-    return null;
+    const start = output.indexOf("{");
+    const end = output.lastIndexOf("}");
+    if (start < 0 || end <= start) {
+      return { loggedIn: false, detail: "auth-status-parse-error" };
+    }
+    try {
+      payload = JSON.parse(output.slice(start, end + 1));
+    } catch {
+      return { loggedIn: false, detail: "auth-status-parse-error" };
+    }
   }
+
+  return interpretClaudeAuthStatus(payload);
 }
 
 const SUBSCRIPTION_CHECK_TTL_MS = 60_000;
@@ -118,10 +115,11 @@ let subscriptionCheck: { at: number; result: Promise<string | null> } | null =
  * open so a slow CLI never blocks subscription users; a signed-out CLI fails
  * on its own with an auth error. Cached briefly to keep turns fast.
  */
-type AuthStatusProbe = () => { loggedIn: boolean; detail: string } | null;
+type AuthStatus = { loggedIn: boolean; detail: string } | null;
+type AuthStatusProbe = () => AuthStatus | Promise<AuthStatus>;
 
-const defaultAuthStatusProbe: AuthStatusProbe = () => {
-  const binaryPath = resolveClaudeCli(process.env);
+const defaultAuthStatusProbe: AuthStatusProbe = async () => {
+  const binaryPath = await resolveClaudeCli(process.env);
   return binaryPath ? probeClaudeAuthStatusCli({ binaryPath }) : null;
 };
 let authStatusProbe = defaultAuthStatusProbe;
@@ -139,8 +137,14 @@ export function checkSubscriptionAuth(
   if (subscriptionCheck && now - subscriptionCheck.at < SUBSCRIPTION_CHECK_TTL_MS) {
     return subscriptionCheck.result;
   }
-  const result = Promise.resolve().then(() => {
-    const status = probe();
+  const result = Promise.resolve().then(async () => {
+    // A failing probe fails open like an unknown result.
+    let status: AuthStatus = null;
+    try {
+      status = await probe();
+    } catch {
+      status = null;
+    }
     if (status?.detail === "api-key-only") {
       return "Claude Code CLI is signed in with an API key. This provider works only with a Claude plan; use OpenCode's built-in Anthropic provider for API keys, or run `claude auth login --claudeai`.";
     }
@@ -162,7 +166,7 @@ export async function detectClaudeCode(options?: {
   const binaryPath =
     options?.binaryPath !== undefined
       ? options.binaryPath
-      : resolveClaudeCli(env);
+      : await resolveClaudeCli(env);
 
   if (!binaryPath) {
     return {
@@ -176,20 +180,13 @@ export async function detectClaudeCode(options?: {
     };
   }
 
-  let version: string | null = null;
-  try {
-    const result = spawnSync(binaryPath, ["--version"], {
-      encoding: "utf8",
-      timeout: 4000,
-      env: buildClaudeCodeChildEnv(env) as NodeJS.ProcessEnv,
-      windowsHide: true,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    const match = `${result.stdout || ""}`.trim().match(/(\d+\.\d+\.\d+)/);
-    version = match?.[1] ?? (`${result.stdout || ""}`.trim() || null);
-  } catch {
-    version = null;
-  }
+  const versionRun = await runCliProbe(binaryPath, ["--version"], {
+    env: buildClaudeCodeChildEnv(env),
+    timeoutMs: 4000,
+  });
+  const versionOutput = versionRun.stdout.trim();
+  const version =
+    versionOutput.match(/(\d+\.\d+\.\d+)/)?.[1] ?? (versionOutput || null);
 
   const sdk = await probeClaudeAgentSdk();
   if (!sdk.available) {
@@ -203,7 +200,7 @@ export async function detectClaudeCode(options?: {
     };
   }
 
-  const authStatus = probeClaudeAuthStatusCli({ binaryPath, env });
+  const authStatus = await probeClaudeAuthStatusCli({ binaryPath, env });
   const loggedIn = Boolean(authStatus?.loggedIn);
 
   if (!loggedIn) {

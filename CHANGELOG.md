@@ -1,5 +1,47 @@
 # Changelog
 
+## 1.1.0 - 2026-09-26
+
+Several fixes in this release were found and first built by Bryan Galdámez
+([@JosueGalRe](https://github.com/JosueGalRe)) in his fork; thanks!
+
+- **Fix: messages before your prompt were dropped**: only the newest user
+  message reached Claude, so OpenChamber's inline comments, queued messages
+  and OpenCode's Plan-mode reminder were lost. Every user message since the
+  last reply now reaches Claude, and messages typed while a tool runs arrive
+  with its result.
+- **Tool results with images and PDFs**: a screenshot or PDF read by a tool now
+  reaches Claude instead of a text placeholder.
+- **Parallel tool calls**: all tool calls of one Claude reply go to OpenCode at
+  once (reads, subagents), instead of one round trip each. Fewer steps also
+  means fewer re-reads of the whole context.
+- **Subagents stay visible**: the subagent list moves to the front of the task
+  tool description, which Claude Code truncates at 2048 characters.
+- **Refusals are real errors**: an API refusal before any output is answered
+  with its HTTP status and message instead of a 200 with error text.
+- **Rate-limit resets**: weekly/dated ("resets Oct 6, 1pm") and hours-only
+  resets are parsed, and a limit message without a reset time no longer reuses
+  another window's reset (which could block turns for days).
+- **No blocking CLI probes**: `claude auth status` and CLI lookups run async,
+  so they no longer stall the OpenCode server.
+- **Abandoned turns are reaped**: a turn parked on tool calls that never get
+  answered is closed after an hour (`OPENCODE_CLAUDE_PARKED_TURN_TTL_MS`),
+  and closing a turn now really stops its `claude` process.
+- **Security: Claude Code's built-in tools are never enabled**: a turn that
+  arrived without OpenCode tools used to get Bash/Edit auto-approved, bypassing
+  OpenCode permissions. It now gets no tools.
+- **Prompts, t3code-style**: chat turns keep Claude Code's system prompt and
+  append a short note that Claude is running in OpenChamber through the
+  Claude Code harness. Titles, summaries and generate use a one-line system
+  prompt with the task in the user message (~15x smaller than before).
+- **Stable model ids and honest names**: models are listed under their
+  concrete ids (`claude-opus-5-5[1m]`, `claude-sonnet-5`…), like t3code, so a
+  session no longer moves to a new model when the CLI's `opus` alias does.
+  Names come from the id ("Opus 5.5"), not the CLI's version-dependent label.
+  Sessions that picked a 1.0.0 alias (`opus[1m]`, `sonnet`, `haiku`) need a
+  model picked once.
+- **Clearer usage log**: `turn usage` shows steps, context per step, and totals.
+
 ## 1.0.0 - 2026-09-25
 
 Requires OpenCode 2.x. OpenCode 1.x users stay on 0.14.

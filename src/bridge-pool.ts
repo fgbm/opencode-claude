@@ -3,12 +3,14 @@
  * (Cursor bridge-pool pattern).
  */
 import type { ClaudeQueryHandle } from "./query.js";
+import type { McpToolResultContent } from "./prompt.js";
+import type { OpenAIUsage } from "./usage.js";
 
 export type ParkedToolCall = {
   id: string;
   name: string;
   arguments: string;
-  resolve: (result: string) => void;
+  resolve: (result: McpToolResultContent[]) => void;
   reject: (error: Error) => void;
 };
 
@@ -17,8 +19,13 @@ export type ParkedBridge = {
   conversationKey: string;
   handle: ClaudeQueryHandle;
   pendingTools: Map<string, ParkedToolCall>;
-  /** SDK assistant messages whose usage was already reported to OpenCode. */
-  seenAssistantUsageIds: Set<string>;
+  /**
+   * Usage already reported to OpenCode per SDK assistant message, so a
+   * continuation reports only what a call grew by since the last response.
+   */
+  reportedUsage: Map<string, OpenAIUsage>;
+  /** Keys of mid-turn user messages already attached to a tool result. */
+  forwardedSteering: Set<string>;
   createdAt: number;
   /** Continues consuming the SDK stream after tools resolve. */
   continueStream?: () => AsyncGenerator<unknown, void, unknown>;

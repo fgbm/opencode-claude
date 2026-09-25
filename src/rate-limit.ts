@@ -45,6 +45,12 @@ export type ClaudeRateLimitState = {
 /** When a hard limit error carries no reset time, block new turns briefly. */
 const FALLBACK_BLOCK_MS = 10 * 60 * 1000;
 
+/**
+ * A stored `rejected` event older than this no longer describes the limit a
+ * fresh error hit; its resetsAt must not be reused as the block deadline.
+ */
+const REJECTION_EVENT_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+
 function storePath(): string {
   const override = process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE;
   if (override && override.trim()) return override.trim();
@@ -120,66 +126,164 @@ export function recordRateLimitInfo(info: unknown): ClaudeRateLimitState | null 
   return next;
 }
 
-/** Match human-readable hard-limit error text from the Agent SDK / API. */
+/**
+ * Match hard-limit error text from the Agent SDK / API. Claude Code words
+ * subscription limits as "You've hit your session limit", "You've hit your
+ * weekly limit", "You've reached your … limit"; raw API throttling surfaces as
+ * `API Error: 429 {"error":{"type":"rate_limit_error",…}}`. A bare "429"
+ * elsewhere (a line number, a byte count) is not enough, so the status only
+ * counts when it follows the "API Error:" prefix.
+ */
 export function isClaudeRateLimitText(text: string): boolean {
   return (
-    /hit your (session|usage) limit/i.test(text) ||
+    /\b(hit|reached) your [^·\n]*?limit/i.test(text) ||
     /usage limit reached/i.test(text) ||
-    /rate[ -]?limit/i.test(text) ||
-    /too many requests/i.test(text) ||
-    /\b429\b/.test(text)
+    /rate[ _-]?limit/i.test(text) ||
+    /API Error:\s*429\b/i.test(text) ||
+    /too many requests/i.test(text)
+  );
+}
+
+const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+
+/** Full-precision wall-clock formatter for `zone`; undefined for an unknown zone. */
+function zoneFormatter(zone: string): Intl.DateTimeFormat | undefined {
+  try {
+    return new Intl.DateTimeFormat("en-US", {
+      timeZone: zone,
+      year: "numeric",
+      month: "numeric",
+      day: "numeric",
+      hour: "numeric",
+      minute: "numeric",
+      second: "numeric",
+      hourCycle: "h23",
+    });
+  } catch {
+    return undefined;
+  }
+}
+
+/** Wall clock of instant `t` in the formatter's zone, encoded as a UTC epoch. */
+function wallClockAsUtc(fmt: Intl.DateTimeFormat, t: number): number {
+  const parts = fmt.formatToParts(new Date(t));
+  const get = (type: Intl.DateTimeFormatPartTypes) =>
+    Number(parts.find((p) => p.type === type)?.value);
+  return Date.UTC(
+    get("year"),
+    get("month") - 1,
+    get("day"),
+    get("hour") % 24,
+    get("minute"),
+    get("second"),
   );
 }
 
 /**
- * Parse "resets 1:10am (Europe/Kyiv)" / "reset at 2026-08-09T01:10:00" into
- * epoch ms. Returns undefined when no reset hint is present.
+ * Instant whose wall clock in the formatter's zone is `wall` (a UTC-encoded
+ * wall time). Two offset passes settle DST transitions; a wall time skipped
+ * by a spring-forward gap does not exist and yields undefined.
+ */
+function zonedWallToEpoch(fmt: Intl.DateTimeFormat, wall: number): number | undefined {
+  const offsetAt = (t: number) => wallClockAsUtc(fmt, t) - Math.floor(t / 1000) * 1000;
+  let t = wall - offsetAt(wall);
+  t = wall - offsetAt(t);
+  return wallClockAsUtc(fmt, t) === wall ? t : undefined;
+}
+
+/**
+ * Parse a reset hint into epoch ms. Returns undefined when no reset hint is
+ * present. Claude Code formats reset times (`resets ${time} (${zone})`) as:
+ * - within 24h: "1:10am (Europe/Kyiv)", "5pm (UTC)";
+ * - further out: "Oct 6, 1pm (UTC)", "Oct 6, 1:30pm (America/New_York)";
+ * - in another year: "Jan 2, 2027, 1pm (UTC)";
+ * plus ISO "reset at 2026-08-09T01:10:00" / "resets 2026-10-06 13:00 UTC".
  */
 export function parseResetTimeFromText(
   text: string,
   now: number = Date.now(),
 ): number | undefined {
-  // ISO-ish absolute timestamp
-  const iso = /resets?\s+(?:at\s+)?(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)/i.exec(
-    text,
-  );
+  // ISO-ish absolute timestamp; a trailing " UTC" stands for "Z".
+  const iso =
+    /resets?\s+(?:at\s+)?(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(Z|[+-]\d{2}:?\d{2})?)(\s*UTC\b)?/i.exec(
+      text,
+    );
   if (iso) {
-    const parsed = Date.parse(iso[1].includes("T") ? iso[1] : iso[1].replace(" ", "T"));
+    const stamp = iso[1].replace(" ", "T") + (!iso[2] && iso[3] ? "Z" : "");
+    const parsed = Date.parse(stamp);
     if (Number.isFinite(parsed)) return parsed;
   }
 
-  // "resets 1:10am (Europe/Kyiv)" / "resets at 13:05 (UTC)" style
+  // "resets Oct 6, 1pm (UTC)" / "resets Jan 2, 2027, 1:30pm (America/New_York)"
+  const dated =
+    /resets?\s+(?:at\s+)?(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})(?:,?\s+(\d{4}))?(?:,\s*|\s+)(?:at\s+)?(\d{1,2})(?::(\d{2}))?[\s\u202f]*(am|pm)?\s*\(([^)]+)\)/i.exec(
+      text,
+    );
+  if (dated) {
+    const month = MONTHS.indexOf(dated[1].toLowerCase());
+    const day = Number(dated[2]);
+    let hour = Number(dated[4]);
+    const minute = dated[5] === undefined ? 0 : Number(dated[5]);
+    const meridiem = dated[6]?.toLowerCase();
+    if (dated[5] === undefined && !meridiem) return undefined;
+    if (meridiem) {
+      if (hour < 1 || hour > 12) return undefined;
+      if (meridiem === "pm" && hour < 12) hour += 12;
+      if (meridiem === "am" && hour === 12) hour = 0;
+    }
+    if (hour > 23 || minute > 59) return undefined;
+    const fmt = zoneFormatter(dated[7].trim());
+    if (!fmt) return undefined; // unknown IANA zone
+    const resolve = (year: number) => {
+      const wall = Date.UTC(year, month, day, hour, minute);
+      // Reject overflowed dates such as "Feb 30".
+      if (new Date(wall).getUTCMonth() !== month) return undefined;
+      return zonedWallToEpoch(fmt, wall);
+    };
+    if (dated[3] !== undefined) return resolve(Number(dated[3]));
+    // No year: the CLI omits it for the current year, so take the nearest
+    // occurrence that is not long past (Dec 30 → "Jan 2" is next year).
+    const year = new Date(wallClockAsUtc(fmt, now)).getUTCFullYear();
+    for (const y of [year - 1, year, year + 1]) {
+      const t = resolve(y);
+      if (t !== undefined && t > now - 24 * 3_600_000) return t;
+    }
+    return undefined;
+  }
+
+  // "resets 1:10am (Europe/Kyiv)" / "resets at 13:05 (UTC)" / "resets 5pm (UTC)"
   const wall =
-    /resets?\s+(?:at\s+)?(\d{1,2}):(\d{2})\s*(am|pm)?\s*\(([^)]+)\)/i.exec(text);
+    /resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*\(([^)]+)\)/i.exec(
+      text,
+    );
   if (!wall) return undefined;
+  // Hours without minutes need a meridiem; a lone "resets 5 (UTC)" is noise.
+  if (wall[2] === undefined && !wall[3]) return undefined;
   let hour = Number(wall[1]);
-  const minute = Number(wall[2]);
+  const minute = wall[2] === undefined ? 0 : Number(wall[2]);
   const meridiem = wall[3]?.toLowerCase();
   const zone = wall[4].trim();
   if (meridiem === "pm" && hour < 12) hour += 12;
   if (meridiem === "am" && hour === 12) hour = 0;
   if (hour > 23 || minute > 59) return undefined;
 
-  // Find the earliest future instant whose wall clock in `zone` is hour:minute.
-  let fmt: Intl.DateTimeFormat;
-  try {
-    fmt = new Intl.DateTimeFormat("en-US", {
-      timeZone: zone,
-      hour: "2-digit",
-      minute: "2-digit",
-      hour12: false,
-    });
-  } catch {
-    return undefined; // unknown IANA zone
-  }
-  const target = hour * 60 + minute;
-  // Scan forward in 5-minute steps; limit resets are within ~24h by design.
-  for (let t = now + 60_000; t <= now + 26 * 3_600_000; t += 5 * 60_000) {
-    const parts = fmt.formatToParts(new Date(t));
-    const h = Number(parts.find((p) => p.type === "hour")?.value);
-    const m = Number(parts.find((p) => p.type === "minute")?.value);
-    const cur = (h === 24 ? 0 : h) * 60 + m;
-    if (Math.abs(cur - target) <= 2) return t;
+  const fmt = zoneFormatter(zone);
+  if (!fmt) return undefined; // unknown IANA zone
+  // Exact wall time today, else tomorrow (limit resets are within ~24h by
+  // design). Resolving via the zone's offset avoids the drift of a stepped
+  // scan, which could land minutes before the real reset. A DST-skipped wall
+  // time has no instant, so that day is skipped.
+  const today = new Date(wallClockAsUtc(fmt, now));
+  for (let dayOffset = 0; dayOffset <= 2; dayOffset++) {
+    const wallTarget = Date.UTC(
+      today.getUTCFullYear(),
+      today.getUTCMonth(),
+      today.getUTCDate() + dayOffset,
+      hour,
+      minute,
+    );
+    const t = zonedWallToEpoch(fmt, wallTarget);
+    if (t !== undefined && t > now) return t;
   }
   return undefined;
 }
@@ -187,20 +291,47 @@ export function parseResetTimeFromText(
 /**
  * Record a hard-limit error message. Returns the updated state, or null when
  * the text is not a limit error.
+ *
+ * Block deadline, in order: the reset parsed from the text; the resetsAt of a
+ * recent `rejected` rate_limit_event (the SDK emits it right before the
+ * failing result); an already-active confirmed block; else a short fallback.
+ * The stored resetsAt of any other event (e.g. an `allowed` seven_day window
+ * days away) describes an unrelated window and never becomes the deadline.
  */
 export function recordRateLimitErrorText(
   text: string,
 ): ClaudeRateLimitState | null {
   if (!text || !isClaudeRateLimitText(text)) return null;
-  const prev = readState() ?? { limited: false, updatedAt: 0 };
-  const resetsAt = parseResetTimeFromText(text) ?? prev.resetsAt;
+  const stored: ClaudeRateLimitState = readState() ?? {
+    limited: false,
+    updatedAt: 0,
+  };
+  const { resetsAt: prevResetsAt, ...prev } = stored;
   const now = Date.now();
+  const parsed = parseResetTimeFromText(text, now);
+  const rejectionResetsAt =
+    prev.status === "rejected" &&
+    now - prev.updatedAt < REJECTION_EVENT_MAX_AGE_MS &&
+    prevResetsAt !== undefined &&
+    prevResetsAt > now
+      ? prevResetsAt
+      : undefined;
+  const activeUntil =
+    prev.limited && prev.limitedUntil !== undefined && prev.limitedUntil > now
+      ? prev.limitedUntil
+      : undefined;
+  const resetsAt =
+    parsed !== undefined && parsed > now
+      ? parsed
+      : (rejectionResetsAt ??
+        (activeUntil !== undefined && activeUntil === prevResetsAt
+          ? prevResetsAt
+          : undefined));
   const next: ClaudeRateLimitState = {
     ...prev,
     limited: true,
-    limitedUntil:
-      resetsAt && resetsAt > now ? resetsAt : now + FALLBACK_BLOCK_MS,
-    ...(resetsAt ? { resetsAt } : {}),
+    limitedUntil: resetsAt ?? activeUntil ?? now + FALLBACK_BLOCK_MS,
+    ...(resetsAt !== undefined ? { resetsAt } : {}),
     message: text.trim().slice(0, 300),
     updatedAt: now,
   };
@@ -213,6 +344,7 @@ export function normalizeClaudeErrorText(text: string): string {
   return text
     .replace(/^\[claude-code error\]\s*/i, "")
     .replace(/^claude code returned an error result:\s*/i, "")
+    .replace(/^rate limit:\s*/i, "") // tag added for SDK rate_limit events
     .replace(/\s*·\s*limit resets in .*$/i, "") // appended countdown suffix
     .replace(/\s+/g, " ")
     .trim()

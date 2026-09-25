@@ -200,7 +200,7 @@ export async function startClaudeQuery(
   const cwd = assertClaudeWorkingDirectory(params.cwd);
   const pathToClaudeCodeExecutable =
     trimmedString(params.pathToClaudeCodeExecutable) ||
-    resolveClaudeCodeExecutable({ env }) ||
+    (await resolveClaudeCodeExecutable({ env })) ||
     undefined;
 
   const options: Record<string, unknown> = {
@@ -365,6 +365,16 @@ export async function startClaudeQuery(
     if (closed) return;
     closed = true;
     killProcessTree(getPid(), { signal: "SIGTERM", force: true });
+    // The SDK Query exposes no pid, so the tree-kill above is a no-op for it;
+    // Query.close() is what actually ends the CLI subprocess. A parked turn
+    // is not being iterated, and return() alone leaves its child running.
+    if (result && typeof result.close === "function") {
+      try {
+        result.close();
+      } catch {
+        // already torn down
+      }
+    }
     if (result && typeof result.return === "function") {
       try {
         Promise.resolve(result.return()).catch(() => {});
@@ -394,7 +404,7 @@ export async function listClaudeSupportedModels(
     });
   })();
   const env = buildClaudeCodeChildEnv(process.env);
-  const pathToClaudeCodeExecutable = resolveClaudeCodeExecutable({ env });
+  const pathToClaudeCodeExecutable = await resolveClaudeCodeExecutable({ env });
   const q = queryFn({
     prompt: idle,
     options: {

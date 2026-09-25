@@ -347,6 +347,23 @@ function convertPart(part: unknown, blocks: AnthropicContentBlock[]): void {
   }
 }
 
+/**
+ * Marker text of the synthetic user message OpenCode emits when it promotes
+ * tool-result media for providers that cannot carry media in tool results
+ * (every openai-compatible provider, including this one).
+ */
+export const SYNTHETIC_TOOL_MEDIA_PROMPT = "Attached media from tool result:";
+
+export function isSyntheticToolMediaMessage(msg: {
+  role?: string;
+  content?: unknown;
+}): boolean {
+  return (
+    msg?.role === "user" &&
+    extractTextContent(msg.content).trim() === SYNTHETIC_TOOL_MEDIA_PROMPT
+  );
+}
+
 export function extractTextContent(content: unknown): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
@@ -390,30 +407,307 @@ export function openaiContentToAnthropicBlocks(
   return blocks;
 }
 
+export type McpToolResultContent =
+  | { type: "text"; text: string }
+  | { type: "image"; data: string; mimeType: string }
+  | {
+      type: "resource";
+      resource: { uri: string; mimeType: string; blob: string };
+    };
+
 /**
- * Latest user turn as a Claude Agent SDK prompt (string when text-only).
+ * Convert OpenAI-compatible tool result content into MCP result blocks.
+ * OpenCode's read tool returns images and PDFs as file attachments on the
+ * tool result; those must stay attached when the parked Claude SDK tool call
+ * resumes. Base64 documents travel as MCP embedded `resource` blobs (Claude
+ * Code saves them to disk and hands the model the path); URL-sourced media
+ * cannot ride in an MCP result, so the model gets the URL as text instead of
+ * a silent drop.
+ */
+export function openaiToolResultToMcpContent(
+  content: unknown,
+): McpToolResultContent[] {
+  const result: McpToolResultContent[] = [];
+  for (const block of openaiContentToAnthropicBlocks(content)) {
+    if (block.type === "text") {
+      result.push(block);
+      continue;
+    }
+    if (block.source.type === "url") {
+      result.push({
+        type: "text",
+        text: `[${block.type === "image" ? "Image" : "Document"} attachment could not be relayed inline; source URL: ${block.source.url}]`,
+      });
+      continue;
+    }
+    if (block.type === "image") {
+      result.push({
+        type: "image",
+        data: block.source.data,
+        mimeType: block.source.media_type,
+      });
+      continue;
+    }
+    const mimeType = block.source.media_type;
+    const extension = mimeType === "application/pdf" ? ".pdf" : "";
+    result.push({
+      type: "resource",
+      resource: {
+        uri: `opencode://tool-result/attachment-${result.length + 1}${extension}`,
+        mimeType,
+        blob: block.source.data,
+      },
+    });
+  }
+  return result;
+}
+
+const UNRELAYABLE_USER_MESSAGE =
+  "[The user's latest message contained an attachment that could not be relayed to Claude (unsupported format or location). Tell the user it could not be read.]";
+
+/**
+ * Indices of the latest user turn: every real user message after the last
+ * assistant message, in order. OpenCode queues messages the user sends while
+ * no turn runs for them; they arrive together and all await one answer.
+ * OpenCode's synthetic "Attached media from tool result:" messages are tool
+ * output, not user turns, and are skipped. When the step after the last
+ * assistant message holds only tool output, the newest real user message
+ * stands in — never an older one, which would make Claude redo an answered
+ * request. Empty without any real user message.
+ */
+function latestUserTurn(
+  messages: Array<{ role?: string; content?: unknown }>,
+): number[] {
+  const turn: number[] = [];
+  // An assistant message was passed before any real user message.
+  let toolStep = false;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (msg?.role === "assistant") {
+      if (turn.length > 0) break;
+      toolStep = true;
+    } else if (msg?.role === "user" && !isSyntheticToolMediaMessage(msg)) {
+      turn.unshift(i);
+      if (toolStep) break;
+    }
+  }
+  return turn;
+}
+
+/**
+ * One user message as prompt content: its blocks when it carries
+ * attachments, else its text. When parts were sent but none converted (e.g.
+ * a `file://` image), says so instead of going silent; a truly empty
+ * message yields "".
+ */
+function userMessagePrompt(content: unknown): string | AnthropicContentBlock[] {
+  const blocks = contentHasAttachments(content)
+    ? openaiContentToAnthropicBlocks(content)
+    : [];
+  if (blocks.length > 0) return blocks;
+  const text = extractTextContent(content).trim();
+  if (text) return text;
+  const hasParts =
+    Array.isArray(content) &&
+    content.some(
+      (part) =>
+        !part ||
+        typeof part !== "object" ||
+        !("type" in part) ||
+        part.type !== "text",
+    );
+  return hasParts ? UNRELAYABLE_USER_MESSAGE : "";
+}
+
+/**
+ * Latest user turn (see `latestUserTurn`) as a Claude Agent SDK prompt,
+ * string when text-only. Queued messages are combined in order: texts are
+ * separated by a blank line, attachments keep their position.
  */
 export function latestUserPrompt(
   messages: Array<{ role?: string; content?: unknown }>,
 ): string | SdkUserPrompt {
+  const parts = latestUserTurn(messages)
+    .map((i) => userMessagePrompt(messages[i]!.content))
+    .filter((part) => part.length > 0);
+  if (parts.every((part) => typeof part === "string")) {
+    return parts.join("\n\n");
+  }
+  return {
+    type: "user",
+    message: {
+      role: "user",
+      content: parts.flatMap((part) =>
+        typeof part === "string" ? [{ type: "text" as const, text: part }] : part,
+      ),
+    },
+    parent_tool_use_id: null,
+  };
+}
+
+/**
+ * Steering: user messages OpenCode queued while a bridged tool was running
+ * arrive after the tool results in the resume request. A parked bridge only
+ * consumes tool results, so without this they were silently dropped (and
+ * OpenCode then treats them as answered). Returns the content of the real
+ * user messages after the last tool result; empty when there are none.
+ */
+export function collectSteering(
+  messages: Array<{ role?: string; content?: unknown }>,
+): McpToolResultContent[] {
+  return collectSteeringMessages(messages).flatMap((m) => m.blocks);
+}
+
+/**
+ * Steering messages one by one, each with a `key` that identifies it across
+ * resume requests: its content plus how many earlier user messages carry the
+ * same content. A raw index would not do, because tool results of a split
+ * park get inserted before the queued message in later requests.
+ */
+export function collectSteeringMessages(
+  messages: Array<{ role?: string; content?: unknown }>,
+): Array<{ key: string; blocks: McpToolResultContent[] }> {
+  let lastTool = -1;
+  for (let i = 0; i < messages.length; i++) {
+    if (messages[i]?.role === "tool") lastTool = i;
+  }
+  if (lastTool < 0) return [];
+  const out: Array<{ key: string; blocks: McpToolResultContent[] }> = [];
+  const occurrences = new Map<string, number>();
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    if (msg?.role !== "user" || isSyntheticToolMediaMessage(msg)) continue;
+    const identity = JSON.stringify(msg.content ?? null);
+    const nth = occurrences.get(identity) ?? 0;
+    occurrences.set(identity, nth + 1);
+    if (i <= lastTool) continue;
+    const content = openaiToolResultToMcpContent(msg.content);
+    const hasText = content.some((b) => b.type === "text" && b.text.trim());
+    if (hasText || content.some((b) => b.type !== "text")) {
+      out.push({ key: `${nth}:${identity}`, blocks: content });
+    }
+  }
+  return out;
+}
+
+/** Append steering to a tool result so Claude reads it on resume. */
+export function withSteering(
+  result: McpToolResultContent[],
+  steering: McpToolResultContent[],
+): McpToolResultContent[] {
+  if (steering.length === 0) return result;
+  const text = steering
+    .filter((b): b is { type: "text"; text: string } => b.type === "text")
+    .map((b) => b.text.trim())
+    .filter(Boolean)
+    .join("\n\n");
+  const media = steering.filter((b) => b.type !== "text");
+  return [
+    ...result,
+    {
+      type: "text",
+      text: [
+        "<system-reminder>",
+        "While this tool was running, the user sent the following message(s). Read them now and adjust your current work accordingly; they take priority over earlier instructions where they conflict:",
+        "",
+        text || "(attachments only, see below)",
+        "</system-reminder>",
+      ].join("\n"),
+    },
+    ...media,
+  ];
+}
+
+type ToolStepMessage = {
+  role?: string;
+  content?: unknown;
+  tool_calls?: Array<{ id?: string; function?: { name?: string; arguments?: string } }>;
+  tool_call_id?: string;
+  name?: string;
+};
+
+/**
+ * Index of the last assistant message when it called tools and at least one
+ * of those calls has its result after it: a tool step OpenCode answered.
+ * Null when the last assistant message is a plain reply (a normal new turn).
+ */
+export function answeredToolStepIndex(messages: ToolStepMessage[]): number | null {
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
-    if (msg?.role !== "user") continue;
-    const content = msg.content;
-    if (!contentHasAttachments(content)) {
-      const text = extractTextContent(content).trim();
-      if (text) return text;
-      continue;
-    }
-    const blocks = openaiContentToAnthropicBlocks(content);
-    if (blocks.length === 0) continue;
-    return {
-      type: "user",
-      message: { role: "user", content: blocks },
-      parent_tool_use_id: null,
-    };
+    if (msg?.role !== "assistant") continue;
+    const ids = new Set(
+      (msg.tool_calls ?? []).map((call) => call?.id).filter(Boolean),
+    );
+    if (ids.size === 0) return null;
+    const answered = messages
+      .slice(i + 1)
+      .some((m) => m?.role === "tool" && !!m.tool_call_id && ids.has(m.tool_call_id));
+    return answered ? i : null;
   }
-  return "";
+  return null;
+}
+
+/**
+ * Prompt for tool results no parked turn waits for (proxy restart, cancelled
+ * or reaped park, superseded turn). The Claude process that made the calls
+ * is gone, so the turn is rebuilt: the history before the step is transferred
+ * as usual, and this prompt carries the step itself: the calls, their full
+ * results with media, and any user messages sent after them.
+ */
+export function answeredToolStepPrompt(
+  messages: ToolStepMessage[],
+  assistantIndex: number,
+): SdkUserPrompt {
+  const assistant = messages[assistantIndex]!;
+  const content: AnthropicContentBlock[] = [
+    {
+      type: "text",
+      text: "<tool_results>\nYour previous step called the tools below, but the session that made those calls ended before OpenCode returned their results. They are relayed here. Do not repeat a call unless its result requires it.",
+    },
+  ];
+  const stepText = extractTextContent(assistant.content).trim();
+  if (stepText) {
+    content.push({ type: "text", text: `Your message in that step:\n${stepText}` });
+  }
+  const calls = new Map(
+    (assistant.tool_calls ?? []).map((call) => [call?.id, call?.function]),
+  );
+  const userBlocks: AnthropicContentBlock[] = [];
+  for (const msg of messages.slice(assistantIndex + 1)) {
+    if (msg?.role === "tool" && msg.tool_call_id) {
+      const call = calls.get(msg.tool_call_id);
+      const blocks = openaiContentToAnthropicBlocks(msg.content);
+      content.push(
+        {
+          type: "text",
+          text: `Result of ${call?.name ?? msg.name ?? "tool"} ${call?.arguments ?? ""} (${msg.tool_call_id}):`,
+        },
+        ...(blocks.length > 0 ? blocks : [{ type: "text" as const, text: "(no output)" }]),
+      );
+    } else if (msg && isSyntheticToolMediaMessage(msg)) {
+      content.push(
+        { type: "text", text: "Media attached to these tool results:" },
+        ...openaiContentToAnthropicBlocks(msg.content).filter(
+          (b) => !(b.type === "text" && b.text.trim() === SYNTHETIC_TOOL_MEDIA_PROMPT),
+        ),
+      );
+    } else if (msg?.role === "user") {
+      userBlocks.push(...openaiContentToAnthropicBlocks(msg.content));
+    }
+  }
+  content.push({
+    type: "text",
+    text:
+      userBlocks.length > 0
+        ? "</tool_results>\n\nThe user sent the following after those calls. Respond to it with the results in mind:"
+        : "</tool_results>\n\nContinue the task from these results.",
+  });
+  content.push(...userBlocks);
+  return {
+    type: "user",
+    message: { role: "user", content },
+    parent_tool_use_id: null,
+  };
 }
 
 export async function* promptAsStream(
@@ -433,7 +727,7 @@ export async function* promptAsStream(
 /**
  * Conversation-history transfer.
  *
- * The Agent SDK turn only receives the latest user message; earlier context
+ * The Agent SDK turn only receives the latest user turn; earlier context
  * comes from resuming the sticky Claude session. When no session can be
  * resumed (first claude-code turn after a model switch, lost store, deleted
  * session file), the proxy injects the serialized prior conversation instead
@@ -513,18 +807,24 @@ function serializeHistoryMessage(
   return null;
 }
 
-/** Messages before the latest user turn — the context Claude is missing. */
+/**
+ * Messages before the latest user turn — the context Claude is missing. Ends
+ * before the FIRST message of that turn: queued messages travel in the
+ * prompt and must not repeat in the transcript.
+ *
+ * When the turn is a stand-in (the newest user message, with assistant or
+ * tool output after it), that output is context too and would otherwise land
+ * in neither transcript nor prompt. The prompt only repeats the user message,
+ * so the transcript keeps everything in order, that message included.
+ */
 export function priorMessagesOf(
   messages: ConversationHistoryMessage[],
 ): ConversationHistoryMessage[] {
-  let lastUser = -1;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i]?.role === "user") {
-      lastUser = i;
-      break;
-    }
-  }
-  return lastUser > 0 ? messages.slice(0, lastUser) : [];
+  const start = latestUserTurn(messages)[0] ?? 0;
+  const answeredAfter = messages
+    .slice(start + 1)
+    .some((m) => m?.role === "assistant" || m?.role === "tool");
+  return answeredAfter ? messages.slice() : messages.slice(0, start);
 }
 
 /**
@@ -591,4 +891,34 @@ export function withConversationContext(
       content: [{ type: "text", text: prefix }, ...content],
     },
   };
+}
+
+/** Put a text block ahead of the prompt, keeping any image/PDF blocks. */
+export function withLeadingText(
+  prompt: string | SdkUserPrompt,
+  text: string,
+): string | SdkUserPrompt {
+  if (!text) return prompt;
+  if (typeof prompt === "string") return `${text}\n\n${prompt}`;
+  const content = Array.isArray(prompt.message.content)
+    ? prompt.message.content
+    : [{ type: "text" as const, text: prompt.message.content }];
+  return {
+    ...prompt,
+    message: { role: "user", content: [{ type: "text", text }, ...content] },
+  };
+}
+
+/**
+ * What t3code tells Claude about its host: stated plainly, once, in the
+ * appended runtime note. The Claude Code system prompt itself is never
+ * replaced or rewritten.
+ */
+export function buildRuntimeInstructions(runtime: {
+  modelName?: string;
+  effort?: string;
+}): string {
+  const model = runtime.modelName ? `, as ${runtime.modelName}` : "";
+  const effort = runtime.effort ? ` with ${runtime.effort} reasoning effort` : "";
+  return `<runtime_info>In case you're asked: you are running in OpenChamber through the Claude Code harness${model}${effort}. No need to mention this otherwise.</runtime_info>`;
 }

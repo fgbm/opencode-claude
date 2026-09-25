@@ -73,7 +73,7 @@ async function main() {
   // Usage: the final message_delta count wins over the opening snapshot
   {
     const { TurnUsageTracker, usageFromAnthropic } = await import("../src/usage.ts");
-    const seen = new Set<string>();
+    const seen = new Map<string, any>();
     const tracker = new TurnUsageTracker(seen);
     const start = usageFromAnthropic({ input_tokens: 8, cache_read_input_tokens: 800, output_tokens: 4 })!;
     const final = usageFromAnthropic({ input_tokens: 8, cache_read_input_tokens: 800, output_tokens: 191, output_tokens_details: { thinking_tokens: 112 } })!;
@@ -91,6 +91,35 @@ async function main() {
     const next = new TurnUsageTracker(seen);
     next.add(final, "msg_1");
     assert.equal(next.total(), null);
+
+    // A park handed off before message_delta: the resumed response reports
+    // only the growth of that call, once.
+    const reported = new Map<string, any>();
+    const parkedResp = new TurnUsageTracker(reported);
+    parkedResp.add(start, "msg_p");
+    assert.equal(parkedResp.total()!.completion_tokens, 4);
+    assert.equal(parkedResp.total()!.prompt_tokens, 808);
+    const resumed = new TurnUsageTracker(reported);
+    resumed.add(final, "msg_p");
+    resumed.add(usageFromAnthropic({ input_tokens: 3, output_tokens: 9 })!, "msg_q");
+    const grown = resumed.total()!;
+    assert.equal(grown.completion_tokens, 187 + 9);
+    assert.equal(grown.prompt_tokens, 3);
+    assert.equal(grown.completion_tokens_details?.reasoning_tokens, 112);
+    const again = new TurnUsageTracker(reported);
+    again.add(final, "msg_p");
+    assert.equal(again.total(), null);
+  }
+
+  // Utility turns carry OpenCode's instructions in the user message
+  {
+    const { withLeadingText } = await import("../src/prompt.ts");
+    assert.equal(withLeadingText("body", "<instructions>x</instructions>"), "<instructions>x</instructions>\n\nbody");
+    const withImage: any = withLeadingText(
+      { type: "user", message: { role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "AA==" } }] }, parent_tool_use_id: null } as any,
+      "lead",
+    );
+    assert.deepEqual(withImage.message.content.map((b: any) => b.type), ["text", "image"]);
   }
 
   // Request kinds: hooked session requests vs stateless generation
@@ -128,7 +157,7 @@ async function main() {
       [{ type: "function", function: { name: "edit", description: "Edit a file", parameters } }] as any,
       parked,
       () => {
-        for (const call of parked.values()) call.resolve("done");
+        for (const call of parked.values()) call.resolve([{ type: "text", text: "done" }]);
       },
     );
     const handlers = servers.opencode.instance.server._requestHandlers;
@@ -368,10 +397,10 @@ async function main() {
     );
     chmodSync(fake, 0o755);
 
-    assert.equal(resolveClaudeCli({ PATH: "/usr/bin:/bin", HOME: home }), fake);
+    assert.equal(await resolveClaudeCli({ PATH: "/usr/bin:/bin", HOME: home }), fake);
     // And PATH itself still wins when the CLI is on it.
     assert.equal(
-      resolveClaudeCli({ PATH: "/usr/bin:/bin", HOME: home }).length > 0,
+      (await resolveClaudeCli({ PATH: "/usr/bin:/bin", HOME: home }))!.length > 0,
       true,
     );
   }
@@ -461,21 +490,36 @@ async function main() {
   // Models / effort
   const models = getClaudeModels();
   assert.ok(models.length >= 4);
-  assert.ok(models.some((m) => m.id === "sonnet"));
-  assert.ok(models.some((m) => m.id === "opus"));
-  assert.equal(resolveClaudeModelId("haiku"), "claude-haiku-4-5");
+  assert.ok(models.some((m) => m.id === "claude-sonnet-5"));
+  assert.ok(models.some((m) => m.id === "claude-opus-5-5[1m]"));
+  // 1.0 aliases are no longer listed; the proxy itself still passes them on
+  assert.ok(!models.some((m) => m.id === "opus" || m.id === "sonnet"));
   assert.equal(resolveClaudeModelId("sonnet"), "sonnet");
+  assert.equal(resolveClaudeModelId("opus[1m]"), "opus[1m]");
 
-  const sonnet = getClaudeModels().find((m) => m.id === "sonnet")!;
+  const sonnet = getClaudeModels().find((m) => m.id === "claude-sonnet-5")!;
   const variants = buildEffortVariants(sonnet);
   assert.deepEqual(variants, [...EFFORT_LEVELS]);
   for (const level of EFFORT_LEVELS) assert.equal(isClaudeEffort(level), true);
   assert.equal(sonnet.contextWindow, 200_000);
   // Haiku takes no effort, so it gets no effort variants
   assert.deepEqual(
-    buildEffortVariants(getClaudeModels().find((m) => m.id === "haiku")!),
+    buildEffortVariants(getClaudeModels().find((m) => m.id === "claude-haiku-4-5")!),
     [],
   );
+
+  // Names come from the concrete model id, not the CLI's version-dependent label
+  {
+    const { modelNameFromId } = await import("../src/models.ts");
+    assert.equal(modelNameFromId("claude-opus-5-5"), "Opus 5.5");
+    assert.equal(modelNameFromId("claude-opus-5[1m]"), "Opus 5");
+    assert.equal(modelNameFromId("claude-haiku-4-5-20251001"), "Haiku 4.5");
+    assert.equal(modelNameFromId("opus"), undefined);
+    const [row] = modelsFromSdk([
+      { value: "opus[1m]", displayName: "Opus (1M context)", resolvedModel: "claude-opus-5[1m]" },
+    ]);
+    assert.equal(row!.name, "Opus 5");
+  }
 
   // The CLI's own model list becomes the catalog, with t3code's 1M rules
   {
@@ -489,17 +533,19 @@ async function main() {
     const byId = Object.fromEntries(fromCli.map((m) => [m.id, m]));
     assert.deepEqual(
       fromCli.map((m) => m.id),
-      ["opus[1m]", "sonnet", "sonnet[1m]", "claude-opus-4-8", "haiku"],
+      ["claude-opus-5-5[1m]", "claude-sonnet-5", "claude-sonnet-5[1m]", "claude-opus-4-8", "claude-haiku-4-5-20251001"],
     );
-    assert.equal(byId["opus[1m]"]!.contextWindow, 1_000_000);
-    assert.deepEqual(buildEffortVariants(byId["opus[1m]"]!), ["low", "high"]);
-    assert.equal(byId["sonnet"]!.contextWindow, 200_000);
-    assert.equal(byId["sonnet[1m]"]!.name, "Sonnet 5 (1M)");
+    assert.equal(byId["claude-opus-5-5[1m]"]!.contextWindow, 1_000_000);
+    assert.equal(byId["claude-opus-5-5[1m]"]!.name, "Opus 5.5");
+    assert.deepEqual(buildEffortVariants(byId["claude-opus-5-5[1m]"]!), ["low", "high"]);
+    assert.equal(byId["claude-sonnet-5"]!.contextWindow, 200_000);
+    assert.equal(byId["claude-sonnet-5[1m]"]!.name, "Sonnet 5 (1M)");
     assert.equal(byId["claude-opus-4-8"]!.contextWindow, 1_000_000);
-    assert.deepEqual(buildEffortVariants(byId["haiku"]!), []);
+    assert.deepEqual(buildEffortVariants(byId["claude-haiku-4-5-20251001"]!), []);
     assert.equal(setDiscoveredModels(fromCli), true);
     const ids = getClaudeModels().map((m) => m.id);
-    assert.ok(ids.includes("fable"), "old ids stay resolvable for saved sessions");
+    assert.ok(!ids.includes("fable"), "old aliases are not listed");
+    assert.equal(resolveClaudeModelId("fable"), "fable", "old aliases still reach the CLI");
     assert.equal(setDiscoveredModels(fromCli), false, "unchanged list is not a change");
   }
   assert.equal(isClaudeEffort("nope"), false);
@@ -926,10 +972,10 @@ async function main() {
     assert.equal(info.package, "@opencode/ai/providers/openai-compatible");
     assert.equal(info.settings.baseURL, "http://127.0.0.1:1/v1");
     const listed: any[] = buildClaudeProviderModels(getClaudeModels());
-    const sonnetModel = listed.find((m) => m.id === "sonnet");
+    const sonnetModel = listed.find((m) => m.id === "claude-sonnet-5");
     assert.deepEqual(
       sonnetModel.variants.map((v: any) => v.id),
-      buildEffortVariants(getClaudeModels().find((m) => m.id === "sonnet")!),
+      buildEffortVariants(getClaudeModels().find((m) => m.id === "claude-sonnet-5")!),
     );
     assert.deepEqual(sonnetModel.capabilities.input, ["text", "image", "pdf"]);
   }
@@ -1059,9 +1105,10 @@ async function main() {
       assert.equal(titleOptions!.autoCompactEnabled, false);
       assert.deepEqual(titleOptions!.thinking, { type: "disabled" });
       assert.equal(titleOptions!.resume, undefined);
-      assert.equal(
-        titleOptions!.systemPrompt,
-        "You generate short session titles. Follow the requested output format exactly.",
+      // Utility turns get a one-line prompt that names the host
+      assert.match(
+        String(titleOptions!.systemPrompt),
+        /^You are a text generation helper running in OpenChamber through the Claude Code harness\./,
       );
       assert.match(String(titleOptions!.prompt), /<request>\nExplain how binary search trees work\n<\/request>/);
     } finally {
@@ -1309,6 +1356,11 @@ async function main() {
       const sysPrompt = seenParams.systemPrompt as { append?: string };
       assert.match(sysPrompt.append ?? "", /mcp__opencode__todowrite/);
       assert.match(sysPrompt.append ?? "", /[Bb]atch independent tool calls/);
+      assert.match(
+        sysPrompt.append ?? "",
+        /^<runtime_info>In case you're asked: you are running in OpenChamber through the Claude Code harness/,
+      );
+      assert.equal((seenParams.systemPrompt as { preset?: string }).preset, "claude_code");
 
       // Proxy + mock SDK: hard limit error BEFORE any content — the proxy
       // must answer with a truthful HTTP 429 (not a fake-200 error stream),
@@ -1797,6 +1849,66 @@ async function main() {
         "server_error",
       );
 
+      // Anthropic refusal reported as a synthetic assistant message whose
+      // error isn't rate_limit → its 4xx before any stream, not a fake-200
+      // carrying "[claude-code error]" as the answer. (Fork ad13d30.)
+      const refusedText =
+        "API Error: 400 Third-party apps now draw from your extra usage, not your plan limits.";
+      setClaudeQueryStarter(async () => ({
+        stream: (async function* () {
+          yield { type: "system", subtype: "init", session_id: "ff-refused" };
+          yield {
+            type: "assistant",
+            error: "unknown",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: refusedText }],
+              usage: { input_tokens: 0, output_tokens: 0 },
+            },
+          };
+          yield { type: "result", is_error: true, result: refusedText };
+          throw new Error(`Claude Code returned an error result: ${refusedText}`);
+        })(),
+        interrupt: async () => {},
+        close: () => {},
+        getPid: () => null,
+      }));
+      for (const stream of [true, false]) {
+        const refusedRes = await postTurn(`ff-refused-${stream}`, stream);
+        assert.equal(refusedRes.status, 400, `stream=${stream}`);
+        const refusedJson = (await refusedRes.json()) as {
+          error?: { type?: string; message?: string };
+        };
+        assert.equal(refusedJson.error?.type, "invalid_request_error");
+        assert.match(refusedJson.error?.message ?? "", /Third-party apps/);
+      }
+      // Transient 4xx (timeout, conflict) stay retryable, not passed through.
+      for (const transient of [408, 409]) {
+        mockDeath(`API Error: ${transient} request timed out or conflicted`);
+        const res = await postTurn(`ff-transient-${transient}`, true);
+        assert.equal(res.status, 500, `API ${transient}`);
+        assert.equal(
+          ((await res.json()) as { error?: { type?: string } }).error?.type,
+          "server_error",
+        );
+      }
+      // max_output_tokens follows a truncated answer: not a failed turn.
+      setClaudeQueryStarter(async () => ({
+        stream: (async function* () {
+          yield { type: "system", subtype: "init", session_id: "ff-maxout" };
+          yield {
+            type: "assistant",
+            error: "max_output_tokens",
+            message: { role: "assistant", content: [{ type: "text", text: "partial" }] },
+          };
+          yield { type: "result", is_error: false, usage: {} };
+        })(),
+        interrupt: async () => {},
+        close: () => {},
+        getPid: () => null,
+      }));
+      assert.equal((await postTurn("ff-maxout", true)).status, 200);
+
       // Error AFTER content → still a 200 stream with the inline note once
       setClaudeQueryStarter(async () => ({
         stream: (async function* () {
@@ -2008,8 +2120,8 @@ async function main() {
       }
     }
 
-    // CLI resolution is memoized per PATH+HOME: re-probing spawns sync
-    // child processes that hard-block the host's event loop on every query.
+    // CLI resolution is memoized per PATH+HOME: re-probing would spawn
+    // several child processes on every query.
     const binDir = mkdtempSync(joinPath(tmpdir(), "oc-claude-bin-"));
     try {
       const fakeCli = joinPath(binDir, "claude");
@@ -2019,16 +2131,16 @@ async function main() {
       // (~/.local/bin/claude on this dev box) cannot mask a negative result.
       const env = { PATH: binDir, HOME: binDir };
       resetClaudeCliResolutionCache();
-      const first = resolveClaudeCli(env);
+      const first = await resolveClaudeCli(env);
       assert.ok(first && first.endsWith("claude"), "fake CLI resolved");
       unlinkSync(fakeCli);
-      const second = resolveClaudeCli(env);
+      const second = await resolveClaudeCli(env);
       assert.equal(second, first, "resolution must be memoized");
       resetClaudeCliResolutionCache();
       assert.equal(
-        resolveClaudeCli(env),
+        await resolveClaudeCli(env),
         null,
-        "cache reset must re-probe (and negatives stay uncached)",
+        "cache reset must re-probe",
       );
       resetClaudeCliResolutionCache();
     } finally {

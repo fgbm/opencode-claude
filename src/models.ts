@@ -44,20 +44,17 @@ function model(
 
 /**
  * Fallback catalog for before the CLI has reported its own list (first
- * start, CLI missing or signed out). Ids stay valid after discovery so
- * sessions that picked them keep working.
+ * start, CLI missing or signed out). Same concrete ids as discovery.
+ * OpenCode only runs listed models, so a session that picked a 1.0 alias
+ * (`opus[1m]`, `sonnet`) asks the user to pick a model once.
  */
 const FALLBACK_MODELS: ClaudeModel[] = [
-  model("opus[1m]", "Opus", LIMIT_1M),
+  model("claude-opus-5-5[1m]", "Opus 5.5", LIMIT_1M),
   model("claude-fable-5-1[1m]", "Fable 5.1", LIMIT_1M),
-  model("sonnet", "Sonnet", LIMIT_200K),
-  model("sonnet[1m]", "Sonnet (1M)", LIMIT_1M),
-  model("haiku", "Haiku", LIMIT_200K, "claude-haiku-4-5", []),
-  // Ids earlier plugin versions offered, kept so saved sessions still resolve.
-  model("opus", "Opus", LIMIT_200K),
-  model("fable", "Fable", LIMIT_1M),
+  model("claude-sonnet-5", "Sonnet 5", LIMIT_200K),
+  model("claude-sonnet-5[1m]", "Sonnet 5 (1M)", LIMIT_1M),
+  model("claude-haiku-4-5", "Haiku 4.5", LIMIT_200K, undefined, []),
   model("claude-opus-4-8", "Opus 4.8", LIMIT_1M),
-  model("claude-sonnet-4-6", "Sonnet 4.6", LIMIT_200K),
 ];
 
 /** A row of the Agent SDK's `supportedModels()` answer. */
@@ -84,6 +81,20 @@ const ONE_M_FAMILIES: Array<{ match: RegExp; mode: "default" | "optional" | "fix
 ];
 
 /**
+ * Display name from the concrete model id ("claude-opus-5-5[1m]" →
+ * "Opus 5.5"). CLI display names depend on the CLI version ("Opus (1M
+ * context)" can mean Opus 5 or 5.5), so the id is the source of truth.
+ */
+export function modelNameFromId(id: string | undefined): string | undefined {
+  const match = /^claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?(?:\[1m\])?$/i.exec(
+    id?.trim() ?? "",
+  );
+  if (!match) return undefined;
+  const family = match[1]!.charAt(0).toUpperCase() + match[1]!.slice(1).toLowerCase();
+  return `${family} ${match[2]}${match[3] ? `.${match[3]}` : ""}`;
+}
+
+/**
  * Map the CLI's own model list (supportedModels) into the catalog. The
  * CLI's "default" row only repeats another model, so it is skipped.
  */
@@ -93,9 +104,14 @@ export function modelsFromSdk(rows: SdkModelRow[]): ClaudeModel[] {
     const value = typeof row?.value === "string" ? row.value.trim() : "";
     if (!value || value === "default") continue;
     const efforts = (row.supportedEffortLevels ?? []).filter(isClaudeEffort);
-    const name = row.displayName?.trim() || value;
-    const base = value.replace(/\[1m\]$/i, "");
+    const name =
+      modelNameFromId(row.resolvedModel) ??
+      modelNameFromId(value) ??
+      (row.displayName?.trim() || value);
+    // The concrete id, like t3code: a session stays on the model it picked
+    // instead of moving when the CLI's `opus` alias points somewhere new.
     const family = (row.resolvedModel || value).replace(/\[1m\]$/i, "");
+    const base = family;
     const rule = /\[1m\]$/i.test(value)
       ? { mode: "default" as const }
       : ONE_M_FAMILIES.find((f) => f.match.test(family));
@@ -110,16 +126,15 @@ export function modelsFromSdk(rows: SdkModelRow[]): ClaudeModel[] {
       out.push(model(base, name, LIMIT_200K, undefined, efforts));
     }
   }
-  return out;
+  // An alias row and its concrete row resolve to the same model.
+  const seen = new Set<string>();
+  return out.filter((m) => !seen.has(m.id) && seen.add(m.id));
 }
 
 let discovered: ClaudeModel[] | null = readCachedModels();
 
-/** Discovered models first, then fallback ids the CLI did not list. */
 function buildCatalog(): ClaudeModel[] {
-  if (!discovered?.length) return FALLBACK_MODELS;
-  const ids = new Set(discovered.map((m) => m.id));
-  return [...discovered, ...FALLBACK_MODELS.filter((m) => !ids.has(m.id))];
+  return discovered?.length ? discovered : FALLBACK_MODELS;
 }
 
 export function getClaudeModels(): ClaudeModel[] {

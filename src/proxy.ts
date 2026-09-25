@@ -10,6 +10,7 @@
  */
 import { createHash, randomUUID } from "node:crypto";
 import {
+  clearAllBridges,
   deleteBridge,
   findBridgeByConversation,
   findBridgeByPendingTool,
@@ -28,7 +29,7 @@ import {
   decodeClaudeModelSelection,
   EFFORT_HEADER,
 } from "./model-selection.js";
-import { resolveClaudeModelId } from "./models.js";
+import { getClaudeModels, resolveClaudeModelId } from "./models.js";
 import {
   DIRECTORY_HEADER,
   KIND_HEADER,
@@ -47,6 +48,7 @@ import { log } from "./log.js";
 import { checkSubscriptionAuth } from "./detect.js";
 import {
   getRateLimitSnapshot,
+  isClaudeRateLimitText,
   maybeRateLimitNote,
   normalizeClaudeErrorText,
   rateLimitGate,
@@ -55,12 +57,21 @@ import {
   formatResetCountdown,
 } from "./rate-limit.js";
 import {
+  answeredToolStepIndex,
+  answeredToolStepPrompt,
   buildConversationTranscript,
+  collectSteeringMessages,
   extractTextContent,
+  isSyntheticToolMediaMessage,
   latestUserPrompt,
+  openaiToolResultToMcpContent,
   priorMessagesOf,
   promptAsStream,
   withConversationContext,
+  withLeadingText,
+  buildRuntimeInstructions,
+  withSteering,
+  type McpToolResultContent,
   type SdkUserPrompt,
 } from "./prompt.js";
 import {
@@ -80,6 +91,36 @@ import {
 } from "./usage.js";
 
 const SHARED_PROXY_HEALTH_TIMEOUT_MS = 750;
+/**
+ * A parked turn waits for the assistant message to close so that every tool
+ * call of that message reaches OpenCode in one response (see
+ * PARALLEL_SAFE_TOOLS). This much silence from the CLI ends the wait.
+ */
+const PARK_QUIET_MS = 3_000;
+
+const STRUCTURED_OUTPUT_TOOL = "StructuredOutput";
+
+/**
+ * OpenCode treats a StructuredOutput call as the end of the request and never
+ * sends a tool result back, so such a park is closed after this grace period.
+ */
+function structuredOutputReapMs(): number {
+  const raw = Number(process.env.OPENCODE_CLAUDE_STRUCTURED_OUTPUT_REAP_MS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 60_000;
+}
+
+/**
+ * Max time a turn stays parked on regular tools. Each parked turn holds a
+ * live claude CLI child; a conversation abandoned mid-tool-call would
+ * otherwise keep it until the proxy stops. Results that arrive later still
+ * work: the turn is rebuilt around them (answeredToolStepPrompt). `0`
+ * disables the limit.
+ */
+function parkedTurnTtlMs(): number | null {
+  const raw = Number(process.env.OPENCODE_CLAUDE_PARKED_TURN_TTL_MS);
+  if (!Number.isFinite(raw) || raw < 0) return 3_600_000;
+  return raw === 0 ? null : raw;
+}
 
 /**
  * Max silence from the Claude Agent SDK before the turn is declared dead.
@@ -262,6 +303,8 @@ export async function startProxy(): Promise<number> {
 }
 
 export async function stopProxy(): Promise<void> {
+  // Parked turns each hold a live claude CLI child; nothing resumes them now.
+  clearAllBridges();
   if (server) {
     server.stop(true);
     server = null;
@@ -350,13 +393,61 @@ async function handleRequest(req: Request): Promise<Response> {
 
 function collectToolResults(
   messages: OpenAIMessage[],
-): Map<string, string> {
-  const results = new Map<string, string>();
+): Map<string, McpToolResultContent[]> {
+  const results = new Map<string, McpToolResultContent[]>();
   for (const msg of messages) {
     if (msg.role !== "tool" || !msg.tool_call_id) continue;
-    results.set(msg.tool_call_id, extractTextContent(msg.content));
+    results.set(msg.tool_call_id, openaiToolResultToMcpContent(msg.content));
   }
   return results;
+}
+
+/**
+ * OpenCode promotes tool-result media into a synthetic user message
+ * ("Attached media from tool result:") for providers that cannot carry media
+ * inside tool results, which includes every openai-compatible provider. A
+ * parked turn resumes by resolving the MCP call only, so that message would
+ * be dropped; move its media onto the tool results of the same step instead.
+ * Only the step after the last assistant message counts: older promoted
+ * media already reached Claude with its own tool call.
+ */
+function attachPromotedToolMedia(
+  messages: OpenAIMessage[],
+  toolResults: Map<string, McpToolResultContent[]>,
+): number {
+  let lastAssistant = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role === "assistant") {
+      lastAssistant = i;
+      break;
+    }
+  }
+  const step = messages.slice(lastAssistant + 1);
+  const media = step
+    .filter((msg) => isSyntheticToolMediaMessage(msg))
+    .flatMap((msg) =>
+      openaiToolResultToMcpContent(msg.content).filter(
+        (block) => block.type !== "text",
+      ),
+    );
+  if (media.length === 0) return 0;
+  const stepToolIds = step
+    .filter((msg) => msg.role === "tool" && msg.tool_call_id)
+    .map((msg) => msg.tool_call_id!)
+    .filter((id) => toolResults.has(id));
+  const target = stepToolIds.at(-1);
+  if (!target) return 0;
+  const result = toolResults.get(target)!;
+  // OpenCode does not say which call produced which file; with several
+  // sibling calls the media rides the last one, labelled as shared.
+  if (stepToolIds.length > 1) {
+    result.push({
+      type: "text",
+      text: "Media attached to the tool results of this step:",
+    });
+  }
+  result.push(...media);
+  return media.length;
 }
 
 function selectionFromRequest(
@@ -372,7 +463,10 @@ function selectionFromRequest(
   return { modelId, ...(effort ? { effort } : {}) };
 }
 
-const META_REQUEST_MODEL = resolveClaudeModelId("haiku");
+const META_REQUEST_MODEL = "claude-haiku-4-5";
+
+const UTILITY_SYSTEM_PROMPT =
+  "You are a text generation helper running in OpenChamber through the Claude Code harness. Follow the instructions in the user message and return only the requested output.";
 
 /**
  * One debug line per finished Claude run with the raw token split, so plan
@@ -391,15 +485,24 @@ function logTurnUsage(
   };
   if (!e || e.type !== "result") return;
   const u = e.usage ?? {};
+  const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+  const steps = Math.max(1, num(e.num_turns));
+  const input = num(u.input_tokens);
+  const cacheRead = num(u.cache_read_input_tokens);
+  const cacheWrite = num(u.cache_creation_input_tokens);
+  // The SDK's result usage sums every step (API call) of the run, and each
+  // step re-reads the whole context, so the per-step average is the context
+  // size and the totals are what the run cost against plan limits.
   log.info("[opencode-claude] turn usage", {
     ...context,
-    input: u.input_tokens,
-    cacheRead: u.cache_read_input_tokens,
-    cacheWrite: u.cache_creation_input_tokens,
-    output: u.output_tokens,
-    turns: e.num_turns,
+    steps,
+    contextPerStep: Math.round((input + cacheRead + cacheWrite) / steps),
+    totalInput: input,
+    totalCacheRead: cacheRead,
+    totalCacheWrite: cacheWrite,
+    totalOutput: num(u.output_tokens),
     durationMs: e.duration_ms,
-    estimatedCostUsd: e.total_cost_usd,
+    estimatedApiCostUsd: e.total_cost_usd,
   });
 }
 
@@ -458,6 +561,12 @@ async function handleChatCompletions(
 
   // Resume a parked bridge if OpenCode returned tool results.
   const toolResults = collectToolResults(messages);
+  const promotedMedia = attachPromotedToolMedia(messages, toolResults);
+  if (promotedMedia > 0) {
+    log.info("[opencode-claude] attached promoted tool-result media", {
+      count: promotedMedia,
+    });
+  }
   let existing = findBridgeByConversation(conversationKey);
   // Fallback: match by tool_call_id when the session header is missing/changed.
   if ((!existing || existing.pendingTools.size === 0) && toolResults.size > 0) {
@@ -471,13 +580,39 @@ async function handleChatCompletions(
   }
   if (existing && existing.pendingTools.size > 0) {
     let resolved = 0;
+    // User messages sent while the tool ran ride the last tool result
+    // resolved now. Results of one park can arrive over several resume
+    // requests that all still carry the same queued messages after a tool
+    // result, so the bridge remembers what it forwarded: each reaches Claude
+    // exactly once.
+    const freshSteering = collectSteeringMessages(messages)
+      .map((m) => ({
+        key: createHash("sha1").update(m.key).digest("hex"),
+        blocks: m.blocks,
+      }))
+      .filter((m) => !existing!.forwardedSteering.has(m.key));
+    const steering = freshSteering.flatMap((m) => m.blocks);
+    const resolvable = [...existing.pendingTools.keys()].filter((id) =>
+      toolResults.has(id),
+    );
+    const steeringToolId =
+      steering.length > 0 ? resolvable.at(-1) : undefined;
     for (const [toolId, tool] of existing.pendingTools) {
       const result = toolResults.get(toolId);
       if (result !== undefined) {
-        tool.resolve(result);
+        tool.resolve(
+          toolId === steeringToolId ? withSteering(result, steering) : result,
+        );
         existing.pendingTools.delete(toolId);
         resolved++;
       }
+    }
+    if (steeringToolId) {
+      for (const m of freshSteering) existing.forwardedSteering.add(m.key);
+      log.info("[opencode-claude] forwarding mid-turn user messages", {
+        conversationKey: existing.conversationKey,
+        blocks: steering.length,
+      });
     }
     if (existing.pendingTools.size === 0 && existing.continueStream) {
       log.info("[opencode-claude] resuming parked bridge", {
@@ -536,6 +671,24 @@ async function handleChatCompletions(
   let handle: ClaudeQueryHandle | null = null;
   let parked = false;
   let parkWaiters: Array<() => void> = [];
+  // The assistant message is still streaming: sibling tool calls may follow
+  // the one that parked, so the park is held until the message closes.
+  let messageOpen = false;
+  // next() that was in flight when the turn parked; consumed on resume so
+  // the event it carries is not lost.
+  let pendingNext: Promise<IteratorResult<unknown>> | null = null;
+
+  const trackMessageState = (event: unknown) => {
+    if (!event || typeof event !== "object") return;
+    const e = event as Record<string, unknown>;
+    // Only the stream's message_stop closes the message: the CLI emits an
+    // `assistant` event after every content block, not once per message.
+    if (e.type === "stream_event" && e.event && typeof e.event === "object") {
+      const type = (e.event as { type?: unknown }).type;
+      if (type === "message_start") messageOpen = true;
+      if (type === "message_stop") messageOpen = false;
+    }
+  };
 
   const notifyPark = () => {
     parked = true;
@@ -544,7 +697,23 @@ async function handleChatCompletions(
     for (const resolve of waiters) resolve();
   };
 
-  const prompt = latestUserPrompt(messages);
+  // Tool results with no parked turn waiting for them (reaped, cancelled or
+  // superseded park, proxy restart): rebuild the turn around them instead of
+  // re-sending the original request, which would make Claude start over.
+  const answeredStep = isMetaRequest ? null : answeredToolStepIndex(messages);
+  if (answeredStep !== null) {
+    log.warn(
+      "[opencode-claude] tool results arrived with no parked turn; rebuilding the turn with them",
+      { conversationKey, toolResults: toolResults.size },
+    );
+  }
+  const prompt =
+    answeredStep !== null
+      ? answeredToolStepPrompt(messages, answeredStep)
+      : latestUserPrompt(messages);
+  // History the prompt does not carry itself.
+  const priorMessages =
+    answeredStep !== null ? messages.slice(0, answeredStep) : priorMessagesOf(messages);
   if (typeof prompt !== "string") {
     const parts = Array.isArray(prompt.message.content)
       ? prompt.message.content.map((b) => b.type)
@@ -639,14 +808,12 @@ async function handleChatCompletions(
   // No resumable Claude session (first claude-code turn of this chat, model
   // switch mid-conversation, lost store): serialize the prior OpenCode
   // messages into the prompt so Claude sees the whole conversation.
-  const transcript = resume
-    ? ""
-    : buildConversationTranscript(priorMessagesOf(messages));
+  const transcript = resume ? "" : buildConversationTranscript(priorMessages);
   if (transcript) {
     log.info("[opencode-claude] injecting transferred conversation history", {
       conversationKey,
       transcriptChars: transcript.length,
-      historyMessages: priorMessagesOf(messages).length,
+      historyMessages: priorMessages.length,
     });
   }
   const contextualPrompt = withConversationContext(prompt, transcript);
@@ -667,7 +834,7 @@ async function handleChatCompletions(
           const aliases: Array<[string, string]> = [[name, mcpName]];
           const titled = name.charAt(0).toUpperCase() + name.slice(1);
           if (titled !== name) aliases.push([titled, mcpName]);
-          if (name === "bash") aliases.push(["Bash", mcpName]);
+          if (name === "bash" || name === "shell") aliases.push(["Bash", mcpName]);
           if (name === "read") aliases.push(["Read", mcpName]);
           if (name === "edit") aliases.push(["Edit", mcpName]);
           if (name === "write") aliases.push(["Write", mcpName]);
@@ -685,6 +852,25 @@ async function handleChatCompletions(
   const titleSource = [...messages]
     .reverse()
     .find((message) => message.role === "user");
+  // The task's instructions travel in the user message; the system prompt of
+  // a utility turn is only the fixed one-liner below.
+  const metaInstructions =
+    metaKind === "summary"
+      ? [
+          "<instructions>",
+          metaSystemPrompt(messages),
+          "This is a single-turn text transformation. Return only the requested summary. Do not inspect files, execute commands, or use tools.",
+          "</instructions>",
+        ].filter(Boolean).join("\n")
+      : metaKind === "generate"
+      ? [
+          "<instructions>",
+          metaSystemPrompt(messages) ||
+            "Follow the instructions in the user's message and return only the requested output.",
+          "</instructions>",
+        ].join("\n")
+      : "";
+  const mainPrompt = withLeadingText(contextualPrompt, metaInstructions);
   const queryPrompt: string | AsyncIterable<SdkUserPrompt> = metaKind === "title"
     ? [
         "Create a concise 3-7 word session title for the request quoted below.",
@@ -695,22 +881,11 @@ async function handleChatCompletions(
         extractTextContent(titleSource?.content).trim(),
         "</request>",
       ].join("\n")
-    : typeof contextualPrompt === "string"
-      ? contextualPrompt || " "
-      : promptAsStream(contextualPrompt);
+    : typeof mainPrompt === "string"
+      ? mainPrompt || " "
+      : promptAsStream(mainPrompt);
 
   const hasTodoWrite = openCodeToolNames.includes("todowrite");
-  const utilitySystemPrompt = isMetaRequest
-    ? metaKind === "title"
-      ? "You generate short session titles. Follow the requested output format exactly."
-      : metaKind === "generate"
-      ? metaSystemPrompt(messages) ||
-        "Follow the instructions in the user's message and return only the requested output."
-      : [
-          metaSystemPrompt(messages),
-          "This is a single-turn text transformation. Return only the requested summary. Do not inspect files, execute commands, or use tools.",
-        ].filter(Boolean).join("\n\n")
-    : undefined;
   // Generation is an explicit model choice by the caller; keep it.
   const queryModel =
     metaKind === "title" || metaKind === "summary" ? META_REQUEST_MODEL : model;
@@ -737,42 +912,44 @@ async function handleChatCompletions(
     thinking: isMetaRequest ? { type: "disabled" } : undefined,
     settingSources: isMetaRequest ? [] : undefined,
     skills: isMetaRequest ? [] : undefined,
-    tools: isMetaRequest || bridgeOpenCodeTools ? [] : undefined,
+    // Claude Code's built-in tools are never enabled: every tool runs through
+    // OpenCode, which owns permissions. A turn with no OpenCode tools gets no
+    // tools at all instead of an auto-approved Bash/Edit.
+    tools: [],
     toolAliases,
     allowedTools: bridgeOpenCodeTools
       ? openCodeToolNames.map((n) => `mcp__opencode__${n}`)
       : undefined,
-    permissionMode: isMetaRequest
-      ? "dontAsk"
-      : bridgeOpenCodeTools
-      ? "bypassPermissions"
-      : "acceptEdits",
+    permissionMode: bridgeOpenCodeTools ? "bypassPermissions" : "dontAsk",
     allowDangerouslySkipPermissions: bridgeOpenCodeTools,
-    ...(bridgeOpenCodeTools
-      ? {}
+    // Utility turns (titles, summaries, generate) need none of Claude Code's
+    // coding instructions: a one-line prompt that names the host keeps them
+    // ~15x smaller. Chat turns keep the Claude Code preset untouched.
+    systemPrompt: isMetaRequest
+      ? UTILITY_SYSTEM_PROMPT
       : {
-          canUseTool: async (
-            _toolName: string,
-            input: Record<string, unknown>,
-          ) => ({ behavior: "allow" as const, updatedInput: input }),
-        }),
-    systemPrompt: utilitySystemPrompt || {
-      type: "preset",
-      preset: "claude_code",
-      ...(bridgeOpenCodeTools
-        ? {
-            append: [
-              "You are running inside OpenCode. Built-in Claude Code tools are disabled. Use only the mcp__opencode__* tools provided for this turn; they execute via OpenCode.",
-              "Batch independent tool calls into a single turn instead of calling them one at a time.",
-              ...(hasTodoWrite
-                ? [
-                    "For any multi-step work, ALWAYS write the plan with the mcp__opencode__todowrite tool and keep it updated as you progress. A plan that only exists in your text is lost when the session is restored or handed to another agent.",
-                  ]
-                : []),
-            ].join(" "),
-          }
-        : {}),
-    },
+          type: "preset",
+          preset: "claude_code",
+          append: [
+            buildRuntimeInstructions({
+              modelName: getClaudeModels().find((m) => m.id === selection.modelId)?.name,
+              effort: selection.effort,
+            }),
+            ...(bridgeOpenCodeTools
+              ? [
+                  [
+                    "Built-in Claude Code tools are disabled. Use only the mcp__opencode__* tools provided for this turn; they execute via OpenCode.",
+                    "Batch independent tool calls into a single turn instead of calling them one at a time.",
+                    ...(hasTodoWrite
+                      ? [
+                          "For any multi-step work, ALWAYS write the plan with the mcp__opencode__todowrite tool and keep it updated as you progress. A plan that only exists in your text is lost when the session is restored or handed to another agent.",
+                        ]
+                      : []),
+                  ].join(" "),
+                ]
+              : []),
+          ].join("\n\n"),
+        },
   });
 
   const bridge: ParkedBridge = {
@@ -780,28 +957,75 @@ async function handleChatCompletions(
     conversationKey,
     handle,
     pendingTools,
-    seenAssistantUsageIds: new Set(),
+    reportedUsage: new Map(),
+    forwardedSteering: new Set(),
     createdAt: Date.now(),
   };
   putBridge(bridge);
 
+  let reapTimer: ReturnType<typeof setTimeout> | null = null;
+  const clearParkReap = () => {
+    if (reapTimer) clearTimeout(reapTimer);
+    reapTimer = null;
+  };
+  // A park nobody answers must not keep its claude child alive forever.
+  const armParkReap = () => {
+    clearParkReap();
+    const structuredOnly = [...pendingTools.values()].every(
+      (t) => t.name === STRUCTURED_OUTPUT_TOOL,
+    );
+    const ms = structuredOnly ? structuredOutputReapMs() : parkedTurnTtlMs();
+    if (ms === null) return;
+    reapTimer = setTimeout(() => {
+      reapTimer = null;
+      if (!parked) return;
+      log.info(
+        structuredOnly
+          ? "[opencode-claude] reaping unresumed StructuredOutput park"
+          : "[opencode-claude] reaping parked turn past its TTL",
+        { conversationKey, pending: pendingTools.size },
+      );
+      deleteBridge(bridgeId);
+    }, ms);
+    reapTimer.unref?.();
+  };
+
   async function* consumeStream(): AsyncGenerator<unknown, void, unknown> {
     const iterator = handle!.stream[Symbol.asyncIterator]();
+    // Set once the calls are handed to OpenCode. A stream that ends or fails
+    // while a park is still held is a dead turn, not a parked one.
+    let handedOff = false;
     try {
       while (true) {
+        // Parked and the message is closed: hand every collected call to
+        // OpenCode in one response. Claude Code already grouped the calls it
+        // may run side by side (readOnlyHint ones); here they are only
+        // forwarded, and OpenCode runs one response's calls concurrently.
+        const holding = parked && pendingTools.size > 0;
+        if (holding && !messageOpen) {
+          armParkReap();
+          handedOff = true;
+          yield { type: "__park__", tools: [...pendingTools.values()] };
+          return;
+        }
         const parkControl = {
           cancel: null as (() => void) | null,
         };
         const parkPromise = new Promise<void>((resolve) => {
-          if (parked && pendingTools.size > 0) {
-            resolve();
-            return;
-          }
+          // Already parked: the message close decides, not another park.
+          if (holding) return;
           const entry = () => resolve();
           parkWaiters.push(entry);
           parkControl.cancel = () => {
             parkWaiters = parkWaiters.filter((w) => w !== entry);
           };
+        });
+        // Holding and the CLI went quiet: the message will not close by itself.
+        let quietTimer: ReturnType<typeof setTimeout> | null = null;
+        const quietPromise = new Promise<void>((resolve) => {
+          if (!holding) return;
+          quietTimer = setTimeout(resolve, PARK_QUIET_MS);
+          quietTimer.unref?.();
         });
 
         // Watchdog: total silence from the CLI (dead process, stuck compact,
@@ -824,14 +1048,17 @@ async function handleChatCompletions(
           stallTimer.unref?.();
         });
 
-        const nextPromise = iterator.next();
+        const nextPromise = pendingNext ?? iterator.next();
+        pendingNext = null;
         let raced:
           | { kind: "event"; value: IteratorResult<unknown> }
-          | { kind: "park" };
+          | { kind: "park" }
+          | { kind: "quiet" };
         try {
           raced = await Promise.race([
             nextPromise.then((value) => ({ kind: "event" as const, value })),
             parkPromise.then(() => ({ kind: "park" as const })),
+            quietPromise.then(() => ({ kind: "quiet" as const })),
             stallPromise,
           ]);
         } catch (error) {
@@ -845,33 +1072,23 @@ async function handleChatCompletions(
           throw error;
         } finally {
           if (stallTimer) clearTimeout(stallTimer);
-        }
-
-        if (raced.kind === "park" || (parked && pendingTools.size > 0)) {
-          parkControl.cancel?.();
-          await Promise.resolve();
-          // The iterator's pending next() may already have consumed the
-          // assistant event that carries the parked tool call (and its
-          // per-call usage). Forward it before parking so usage accounting
-          // and session binding stay intact.
-          if (raced.kind === "event" && !raced.value.done) {
-            const pendingEvent = raced.value.value;
-            const pendingSessionId = extractSessionId(pendingEvent);
-            if (pendingSessionId && !isMetaRequest) {
-              setForeignSessionId(conversationKey, pendingSessionId, {
-                modelId: model,
-                cwd,
-              });
-            }
-            yield pendingEvent;
-          }
-          yield { type: "__park__", tools: [...pendingTools.values()] };
-          return;
+          if (quietTimer) clearTimeout(quietTimer);
         }
 
         parkControl.cancel?.();
+        if (raced.kind === "park") {
+          // Keep the in-flight next(); the loop top decides whether to hold.
+          pendingNext = nextPromise;
+          continue;
+        }
+        if (raced.kind === "quiet") {
+          pendingNext = nextPromise;
+          messageOpen = false;
+          continue;
+        }
         if (raced.value.done) break;
         const event = raced.value.value;
+        trackMessageState(event);
         const sessionId = extractSessionId(event);
         if (sessionId && !isMetaRequest) {
           setForeignSessionId(conversationKey, sessionId, {
@@ -883,7 +1100,7 @@ async function handleChatCompletions(
         yield event;
       }
     } finally {
-      if (!parked) {
+      if (!handedOff) {
         handle?.close();
         deleteBridge(bridgeId);
       }
@@ -891,6 +1108,7 @@ async function handleChatCompletions(
   }
 
   bridge.continueStream = async function* () {
+    clearParkReap();
     parked = false;
     parkWaiters = [];
     yield* consumeStream();
@@ -921,6 +1139,63 @@ function extractSessionId(event: unknown): string | null {
     if (typeof sid === "string") return sid;
   }
   return null;
+}
+
+/**
+ * OpenCode tools annotated `readOnlyHint: true` for Claude Code. The CLI runs
+ * MCP tool calls one at a time unless the tool carries that annotation;
+ * annotated calls that sit next to each other in one assistant message form
+ * a group the CLI starts together (a non-annotated call in between splits
+ * the group). The proxy forwards what the CLI started within one message as
+ * one response, and OpenCode runs those calls side by side.
+ * The subagent tools (`subagent` on V2, `task` on V1) are listed on purpose
+ * so subagents run in parallel, like Claude Code's own Agent tool. Tools that
+ * write (edit, write, patch, shell, ...) must stay out.
+ */
+const PARALLEL_SAFE_TOOLS = new Set([
+  "read",
+  "glob",
+  "grep",
+  "list",
+  "codesearch",
+  "webfetch",
+  "websearch",
+  "todoread",
+  "skill",
+  "lsp_diagnostics",
+  "lsp_hover",
+  "task",
+  "subagent",
+]);
+
+/** Claude Code truncates MCP tool descriptions at this many characters. */
+export const CLAUDE_TOOL_DESCRIPTION_LIMIT = 2048;
+
+/**
+ * Headings OpenCode puts before the subagent list it appends to the END of
+ * the subagent tool description: V2's `subagent` tool, then V1's `task`.
+ */
+const AGENT_LIST_MARKERS = [
+  "Available subagents:",
+  "Available agent types and the tools they have access to:",
+];
+
+/**
+ * With enough guidance or subagents the appended list falls past Claude
+ * Code's description cut, so Claude never learns which agents exist. Move
+ * the list to the front: the cut then lands on the tail of the generic
+ * guidance instead. Nothing is dropped here.
+ */
+export function fitToolDescription(description: string): string {
+  if (description.length <= CLAUDE_TOOL_DESCRIPTION_LIMIT) return description;
+  for (const marker of AGENT_LIST_MARKERS) {
+    const at = description.indexOf(marker);
+    if (at <= 0) continue;
+    const agents = description.slice(at).trim();
+    const guidance = description.slice(0, at).trim();
+    return guidance ? `${agents}\n\n${guidance}` : agents;
+  }
+  return description;
 }
 
 /** OpenCode tool parameters as an MCP-valid object schema. */
@@ -980,7 +1255,10 @@ export async function buildOpenCodeMcpServer(
         else if (type === "number" || type === "integer") field = z.number();
         else if (type === "boolean") field = z.boolean();
         else if (type === "array") field = z.array(z.any());
-        else if (type === "object") field = z.record(z.string(), z.any());
+        // Not z.record: the SDK converts shapes with its own bundled zod, and
+        // a newer plugin-side zod emits records through a processor the older
+        // converter cannot run. An open object serialises the same everywhere.
+        else if (type === "object") field = z.object({}).catchall(z.any());
         if (!required.has(key)) {
           field = (field as { optional: () => unknown }).optional();
         }
@@ -993,14 +1271,27 @@ export async function buildOpenCodeMcpServer(
       name: string;
       description: string;
       inputSchema: Record<string, unknown>;
+      annotations?: { readOnlyHint: true };
+      _meta: Record<string, unknown>;
     }> = [];
     const mcpTools = tools
       .map((t) => {
         const name = t.function?.name;
         if (!name) return null;
-        const description = t.function?.description || name;
+        const description = fitToolDescription(t.function?.description || name);
         const params = normalizeToolParameters(t.function?.parameters);
-        listed.push({ name, description, inputSchema: params });
+        const annotations = PARALLEL_SAFE_TOOLS.has(name)
+          ? { readOnlyHint: true as const }
+          : undefined;
+        listed.push({
+          name,
+          description,
+          inputSchema: params,
+          ...(annotations ? { annotations } : {}),
+          // What the SDK's own tools/list sends for alwaysLoad; without it
+          // the CLI may defer the tool behind its tool search.
+          _meta: { "anthropic/alwaysLoad": true },
+        });
         // Lossless zod for argument parsing; loose() keeps keys the schema
         // did not name instead of silently dropping them before OpenCode.
         let shape: unknown;
@@ -1026,19 +1317,23 @@ export async function buildOpenCodeMcpServer(
               resolve: () => {},
               reject: () => {},
             };
-            const resultPromise = new Promise<string>((resolve, reject) => {
-              pending.resolve = resolve;
-              pending.reject = reject;
-            });
+            const resultPromise = new Promise<McpToolResultContent[]>(
+              (resolve, reject) => {
+                pending.resolve = resolve;
+                pending.reject = reject;
+              },
+            );
             // Register before notifying so the stream consumer sees the tool.
             pendingTools.set(id, pending);
             onPark();
             const result = await resultPromise;
+            // An empty tool output still needs one block, or Claude reads
+            // the call as having returned nothing at all.
             return {
-              content: [{ type: "text", text: result }],
+              content: result.length > 0 ? result : [{ type: "text", text: "" }],
             };
           },
-          { alwaysLoad: true },
+          { alwaysLoad: true, ...(annotations ? { annotations } : {}) },
         );
       })
       .filter(Boolean);
@@ -1090,7 +1385,7 @@ async function collectTurnResponse(
 
   let content = "";
   let reasoning = "";
-  const usageTracker = new TurnUsageTracker(bridge.seenAssistantUsageIds);
+  const usageTracker = new TurnUsageTracker(bridge.reportedUsage);
   const mapState: MapState = { messageId: null };
   let resultUsage: OpenAIUsage | null = null;
   let lastErrorNorm: string | null = null;
@@ -1102,7 +1397,15 @@ async function collectTurnResponse(
     const norm = normalizeClaudeErrorText(text);
     if (!norm || norm === lastErrorNorm) return;
     lastErrorNorm = norm;
-    errorText = text;
+    // The limit is the real cause; a later, vaguer wording of the same
+    // failure (the result event) must not downgrade the 429 to a 500.
+    if (
+      !errorText ||
+      classifyClaudeFailure(errorText) !== "rate_limit" ||
+      classifyClaudeFailure(text) === "rate_limit"
+    ) {
+      errorText = text;
+    }
     content += `\n\n[claude-code error] ${text}`;
   };
 
@@ -1288,6 +1591,9 @@ async function probeTurnEvents(
   return fail("Claude Code ended the turn without any output");
 }
 
+/** Anthropic refusals that fail identically on retry. */
+const PASS_THROUGH_4XX = new Set([400, 404, 413, 422]);
+
 /**
  * Truthful HTTP error for a turn that died before producing content.
  * Also records hard subscription limits so the fast-fail gate activates and
@@ -1347,16 +1653,23 @@ function failureResponse(
     );
   }
 
+  // Anthropic refused the request itself (malformed, unknown model, too
+  // large, unprocessable): keep its 4xx, since a retry sends the same request
+  // and fails the same way. Other 4xx such as 408/409 are transient, so they
+  // stay on the retryable path.
+  const apiStatus = Number(/\bAPI Error: (4\d\d)\b/.exec(errorText)?.[1]);
+  const refused =
+    kind === "unknown" && PASS_THROUGH_4XX.has(apiStatus) ? apiStatus : null;
   const hint = failureHintFor(kind);
   return Response.json(
     {
       error: {
         message: hint ? `${errorText} ${hint}` : errorText,
-        type: failureTypeFor(kind),
+        type: refused ? "invalid_request_error" : failureTypeFor(kind),
         code: kind === "auth" ? "claude_auth" : "claude_turn_failed",
       },
     },
-    { status: failureStatusFor(kind) },
+    { status: refused ?? failureStatusFor(kind) },
   );
 }
 
@@ -1412,7 +1725,7 @@ function streamOpenAIResponse(
       });
 
       let finishReason: string | null = "stop";
-      const usageTracker = new TurnUsageTracker(bridge.seenAssistantUsageIds);
+      const usageTracker = new TurnUsageTracker(bridge.reportedUsage);
       const mapState: MapState = { messageId: null };
       let resultUsage: OpenAIUsage | null = null;
       let lastErrorNorm: string | null = null;
@@ -1607,7 +1920,11 @@ type MappedEvent =
 
 /** Text carried by Claude's synthetic assistant API-error message. */
 function assistantErrorText(event: Record<string, unknown>): string | null {
-  if (event.error !== "rate_limit") return null;
+  // Every SDKAssistantMessageError is a failed API call except
+  // `max_output_tokens`, which follows a truncated answer.
+  if (typeof event.error !== "string" || event.error === "max_output_tokens") {
+    return null;
+  }
   const message = event.message;
   if (!message || typeof message !== "object") return null;
   const content = (message as { content?: unknown }).content;
@@ -1623,7 +1940,17 @@ function assistantErrorText(event: Record<string, unknown>): string | null {
     .map((block) => block.text)
     .join("\n")
     .trim();
-  return text || "Claude session/usage limit reached";
+  // The SDK's structured `rate_limit` flag is authoritative. Its text may be
+  // anything (a bare "API Error: 429 …" or a localized message), so tag it
+  // when the wording alone would not classify as a limit: every downstream
+  // path (pre-stream 429, mid-stream retryable error, gate) keys off text.
+  if (text && event.error === "rate_limit" && !isClaudeRateLimitText(text)) {
+    return `Rate limit: ${text}`;
+  }
+  if (text) return text;
+  return event.error === "rate_limit"
+    ? "Claude session/usage limit reached"
+    : `Claude API request failed (${event.error})`;
 }
 
 /** claude CLI text when `resume` points at a session it cannot load. */
@@ -1732,9 +2059,9 @@ function mapSdkEvent(event: unknown, state?: MapState): MappedEvent {
         ? (e.message as Record<string, unknown>)
         : null;
     const usage = usageFromAssistantEvent(event);
-    // During a multi-step Agent SDK run, Claude can exhaust the subscription
-    // on the API call after a tool result. The CLI emits that as a synthetic
-    // assistant message (`error: "rate_limit"`) before the terminal result.
+    // During a multi-step Agent SDK run, an API call after a tool result can
+    // fail (subscription exhausted, request refused). The CLI emits that as a
+    // synthetic assistant message with an `error` before the terminal result.
     // Record it immediately: the HTTP response is already streaming, so only
     // this event can activate the shared countdown/gate in time.
     const errorText = assistantErrorText(e);

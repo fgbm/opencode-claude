@@ -241,34 +241,83 @@ function maxUsage(a: OpenAIUsage, b: OpenAIUsage): OpenAIUsage {
   };
 }
 
+/** Field-wise `a - b`, clamped at zero; null when nothing grew. */
+function usageGrowth(a: OpenAIUsage, b: OpenAIUsage | null): OpenAIUsage | null {
+  if (!b) return { ...a };
+  const diff = (x?: number, y?: number) => Math.max(0, (x ?? 0) - (y ?? 0));
+  const prompt = diff(a.prompt_tokens, b.prompt_tokens);
+  const completion = diff(a.completion_tokens, b.completion_tokens);
+  const cached = diff(
+    a.prompt_tokens_details?.cached_tokens,
+    b.prompt_tokens_details?.cached_tokens,
+  );
+  const cacheWrite = diff(
+    a.prompt_tokens_details?.cache_write_tokens,
+    b.prompt_tokens_details?.cache_write_tokens,
+  );
+  const reasoning = diff(
+    a.completion_tokens_details?.reasoning_tokens,
+    b.completion_tokens_details?.reasoning_tokens,
+  );
+  if (prompt + completion + cached + cacheWrite + reasoning === 0) return null;
+  const promptDetails: NonNullable<OpenAIUsage["prompt_tokens_details"]> = {};
+  if (cached > 0) promptDetails.cached_tokens = cached;
+  if (cacheWrite > 0) promptDetails.cache_write_tokens = cacheWrite;
+  return {
+    prompt_tokens: prompt,
+    completion_tokens: completion,
+    total_tokens: prompt + completion,
+    ...(Object.keys(promptDetails).length
+      ? { prompt_tokens_details: promptDetails }
+      : {}),
+    ...(reasoning > 0
+      ? { completion_tokens_details: { reasoning_tokens: reasoning } }
+      : {}),
+  };
+}
+
 /**
  * Per-HTTP-response usage, one entry per Anthropic API call. The SDK reports
  * a call's usage several times: the assistant events carry the message_start
  * snapshot (output_tokens ≈ 1-4) and only message_delta has the final
  * output. Keeping the max per message id makes the final numbers win.
- * `seen` spans continuations of one bridge, so a call already reported in an
- * earlier response is not counted again.
+ *
+ * `reported` spans continuations of one bridge and holds what each call has
+ * already been reported as. A park can hand off before a call's
+ * message_delta arrives; the resumed response then sees that delta and
+ * reports only the growth over the earlier snapshot, so nothing is counted
+ * twice and the final output tokens are not lost.
  */
 export class TurnUsageTracker {
-  private readonly byId = new Map<string, OpenAIUsage>();
+  private readonly byId = new Map<
+    string,
+    { baseline: OpenAIUsage | null; max: OpenAIUsage }
+  >();
   private anonymous: OpenAIUsage | null = null;
 
-  constructor(private readonly seen: Set<string>) {}
+  constructor(private readonly reported: Map<string, OpenAIUsage>) {}
 
   add(usage: OpenAIUsage, messageId: string | null): void {
     if (!messageId) {
       this.anonymous = addOpenAIUsage(this.anonymous, usage);
       return;
     }
-    const current = this.byId.get(messageId);
-    if (!current && this.seen.has(messageId)) return;
-    this.seen.add(messageId);
-    this.byId.set(messageId, current ? maxUsage(current, usage) : usage);
+    let entry = this.byId.get(messageId);
+    if (!entry) {
+      const baseline = this.reported.get(messageId) ?? null;
+      entry = { baseline, max: baseline ?? usage };
+      this.byId.set(messageId, entry);
+    }
+    entry.max = maxUsage(entry.max, usage);
+    this.reported.set(messageId, entry.max);
   }
 
   total(): OpenAIUsage | null {
     let sum = this.anonymous ? { ...this.anonymous } : null;
-    for (const usage of this.byId.values()) sum = addOpenAIUsage(sum, usage);
+    for (const { baseline, max } of this.byId.values()) {
+      const growth = usageGrowth(max, baseline);
+      if (growth) sum = addOpenAIUsage(sum, growth);
+    }
     return sum;
   }
 }
