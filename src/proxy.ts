@@ -31,6 +31,7 @@ import {
 import { resolveClaudeModelId } from "./models.js";
 import {
   DIRECTORY_HEADER,
+  KIND_HEADER,
   SESSION_HEADER,
   type ClaudeEffort,
 } from "./constants.js";
@@ -43,6 +44,7 @@ import {
   setForeignSessionId,
 } from "./session-store.js";
 import { log } from "./log.js";
+import { checkSubscriptionAuth } from "./detect.js";
 import {
   getRateLimitSnapshot,
   maybeRateLimitNote,
@@ -64,10 +66,12 @@ import {
 import {
   detectMetaRequestKind,
   metaSystemPrompt,
+  type MetaRequestKind,
   requestKeyNamespace,
 } from "./request-kind.js";
 import {
-  addUniqueAssistantUsage,
+  TurnUsageTracker,
+  usageFromAnthropic,
   formatCompactNote,
   resolveTurnUsage,
   usageFromAssistantEvent,
@@ -265,7 +269,28 @@ export async function stopProxy(): Promise<void> {
   }
 }
 
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
+
+/**
+ * Binding to 127.0.0.1 keeps other machines out, but a web page open in the
+ * user's browser can still reach loopback: a no-preflight POST (CSRF) or a
+ * DNS-rebound hostname would spend the user's Claude subscription. OpenCode
+ * calls the proxy server-side, so it never sends Origin and always uses a
+ * loopback Host; anything else is refused.
+ */
+export function isTrustedLocalRequest(req: Request): boolean {
+  if (req.headers.get("origin") !== null) return false;
+  const host = (req.headers.get("host") ?? "").toLowerCase();
+  const name = host.startsWith("[")
+    ? host.slice(0, host.indexOf("]") + 1)
+    : host.split(":")[0];
+  return LOOPBACK_HOSTS.has(name ?? "");
+}
+
 async function handleRequest(req: Request): Promise<Response> {
+  if (!isTrustedLocalRequest(req)) {
+    return new Response("Forbidden", { status: 403 });
+  }
   const url = new URL(req.url);
 
   if (req.method === "GET" && (url.pathname === "/health" || url.pathname === "/v1/health")) {
@@ -347,16 +372,86 @@ function selectionFromRequest(
   return { modelId, ...(effort ? { effort } : {}) };
 }
 
+const META_REQUEST_MODEL = resolveClaudeModelId("haiku");
+
+/**
+ * One debug line per finished Claude run with the raw token split, so plan
+ * usage can be traced to fresh input, cache reads/writes and output.
+ */
+function logTurnUsage(
+  event: unknown,
+  context: { conversationKey: string; metaKind: MetaRequestKind; model: string },
+): void {
+  const e = event as {
+    type?: unknown;
+    usage?: Record<string, unknown>;
+    total_cost_usd?: unknown;
+    num_turns?: unknown;
+    duration_ms?: unknown;
+  };
+  if (!e || e.type !== "result") return;
+  const u = e.usage ?? {};
+  log.info("[opencode-claude] turn usage", {
+    ...context,
+    input: u.input_tokens,
+    cacheRead: u.cache_read_input_tokens,
+    cacheWrite: u.cache_creation_input_tokens,
+    output: u.output_tokens,
+    turns: e.num_turns,
+    durationMs: e.duration_ms,
+    estimatedCostUsd: e.total_cost_usd,
+  });
+}
+
+/**
+ * OpenCode v2 names the request kind through the plugin's model.request hook.
+ * Stateless generation (/api/experimental/generate) bypasses session hooks,
+ * so a request with neither the kind nor the session header is one of those.
+ * Text detection stays as the fallback for hooked requests.
+ */
+export function metaKindFromHeaders(
+  kind: string | null,
+  session: string | null,
+): MetaRequestKind | undefined {
+  if (kind === "title") return "title";
+  if (kind === "compaction") return "summary";
+  if (kind === "generate") return "generate";
+  if (kind === "primary") return null;
+  return undefined;
+}
+
+export function resolveMetaKind(
+  kind: string | null,
+  session: string | null,
+  messages: Parameters<typeof detectMetaRequestKind>[0],
+): MetaRequestKind {
+  const fromHeader = metaKindFromHeaders(kind, session);
+  if (fromHeader !== undefined) return fromHeader;
+  const detected = detectMetaRequestKind(messages);
+  if (detected) return detected;
+  return kind === null && !session ? "generate" : null;
+}
+
 async function handleChatCompletions(
   req: Request,
   body: ChatCompletionRequest,
 ): Promise<Response> {
   const messages = Array.isArray(body.messages) ? body.messages : [];
-  const metaKind = detectMetaRequestKind(messages);
   const sessionHeader = req.headers.get(SESSION_HEADER);
+  const metaKind = resolveMetaKind(
+    req.headers.get(KIND_HEADER),
+    sessionHeader,
+    messages,
+  );
   const conversationKey =
     requestKeyNamespace(metaKind) +
     (sessionHeader || conversationKeyFromMessages(messages));
+  // OpenCode is compacting this chat. The Claude session it would resume
+  // still holds the full uncompacted context, so drop the binding: the next
+  // turn starts a fresh Claude session from the compacted history instead.
+  if (metaKind === "summary") {
+    clearForeignSessionId(sessionHeader || conversationKeyFromMessages(messages));
+  }
   const selection = selectionFromRequest(req, body);
   const model = resolveClaudeModelId(selection.modelId);
   const stream = body.stream !== false;
@@ -479,6 +574,20 @@ async function handleChatCompletions(
     );
   }
 
+  const authRefusal = await checkSubscriptionAuth();
+  if (authRefusal) {
+    return Response.json(
+      {
+        error: {
+          message: authRefusal,
+          type: "authentication_error",
+          code: "claude_subscription_required",
+        },
+      },
+      { status: 401 },
+    );
+  }
+
   // Confirmed hard subscription limit active? Fail fast with a proper 429 +
   // Retry-After instead of spawning a doomed Agent SDK turn (which would
   // surface as a fake "completed" assistant message and burn time).
@@ -594,21 +703,37 @@ async function handleChatCompletions(
   const utilitySystemPrompt = isMetaRequest
     ? metaKind === "title"
       ? "You generate short session titles. Follow the requested output format exactly."
+      : metaKind === "generate"
+      ? metaSystemPrompt(messages) ||
+        "Follow the instructions in the user's message and return only the requested output."
       : [
           metaSystemPrompt(messages),
           "This is a single-turn text transformation. Return only the requested summary. Do not inspect files, execute commands, or use tools.",
         ].filter(Boolean).join("\n\n")
     : undefined;
+  // Generation is an explicit model choice by the caller; keep it.
+  const queryModel =
+    metaKind === "title" || metaKind === "summary" ? META_REQUEST_MODEL : model;
   handle = await queryStarter({
     prompt: queryPrompt,
     cwd,
-    model,
+    // Titles and compaction summaries run as their own one-shot turn that
+    // re-reads the whole chat uncached; haiku keeps that off the plan limits
+    // of the model the user picked for the chat.
+    model: queryModel,
     resume: isMetaRequest ? undefined : resume,
-    effort: selection.effort,
+    effort: isMetaRequest ? undefined : selection.effort,
     env,
     mcpServers: isMetaRequest ? undefined : mcpServers,
     autoCompactEnabled: !isMetaRequest,
     maxTurns: isMetaRequest ? 1 : undefined,
+    // Titles and summaries are never resumed; saving them would fill the
+    // user's Claude Code history with "create a title" sessions.
+    persistSession: isMetaRequest ? false : undefined,
+    // Only the OpenCode tool bridge: the user's Claude Code MCP servers and
+    // claude.ai connectors would add their tool definitions to every turn
+    // and compete with OpenCode's own tools.
+    isolateMcp: true,
     thinking: isMetaRequest ? { type: "disabled" } : undefined,
     settingSources: isMetaRequest ? [] : undefined,
     skills: isMetaRequest ? [] : undefined,
@@ -732,7 +857,7 @@ async function handleChatCompletions(
           if (raced.kind === "event" && !raced.value.done) {
             const pendingEvent = raced.value.value;
             const pendingSessionId = extractSessionId(pendingEvent);
-            if (pendingSessionId) {
+            if (pendingSessionId && !isMetaRequest) {
               setForeignSessionId(conversationKey, pendingSessionId, {
                 modelId: model,
                 cwd,
@@ -748,12 +873,13 @@ async function handleChatCompletions(
         if (raced.value.done) break;
         const event = raced.value.value;
         const sessionId = extractSessionId(event);
-        if (sessionId) {
+        if (sessionId && !isMetaRequest) {
           setForeignSessionId(conversationKey, sessionId, {
             modelId: model,
             cwd,
           });
         }
+        logTurnUsage(event, { conversationKey, metaKind, model: queryModel });
         yield event;
       }
     } finally {
@@ -797,7 +923,22 @@ function extractSessionId(event: unknown): string | null {
   return null;
 }
 
-async function buildOpenCodeMcpServer(
+/** OpenCode tool parameters as an MCP-valid object schema. */
+export function normalizeToolParameters(
+  parameters: unknown,
+): Record<string, unknown> {
+  if (
+    parameters &&
+    typeof parameters === "object" &&
+    !Array.isArray(parameters) &&
+    (parameters as { type?: unknown }).type === "object"
+  ) {
+    return parameters as Record<string, unknown>;
+  }
+  return { type: "object", properties: {} };
+}
+
+export async function buildOpenCodeMcpServer(
   tools: OpenAITool[],
   pendingTools: Map<string, ParkedToolCall>,
   onPark: () => void,
@@ -848,14 +989,30 @@ async function buildOpenCodeMcpServer(
       return shape;
     };
 
+    const listed: Array<{
+      name: string;
+      description: string;
+      inputSchema: Record<string, unknown>;
+    }> = [];
     const mcpTools = tools
       .map((t) => {
         const name = t.function?.name;
         if (!name) return null;
         const description = t.function?.description || name;
-        const shape = jsonSchemaToZodShape(
-          t.function?.parameters as Record<string, unknown> | undefined,
-        );
+        const params = normalizeToolParameters(t.function?.parameters);
+        listed.push({ name, description, inputSchema: params });
+        // Lossless zod for argument parsing; loose() keeps keys the schema
+        // did not name instead of silently dropping them before OpenCode.
+        let shape: unknown;
+        try {
+          shape = (z as unknown as {
+            fromJSONSchema: (s: unknown) => { loose: () => unknown };
+          })
+            .fromJSONSchema(params)
+            .loose();
+        } catch {
+          shape = jsonSchemaToZodShape(params);
+        }
         return toolFactory(
           name,
           description,
@@ -890,7 +1047,18 @@ async function buildOpenCodeMcpServer(
       name: "opencode",
       alwaysLoad: true,
       tools: mcpTools,
-    });
+    }) as { instance?: { server?: { setRequestHandler?: Function } } };
+
+    // The SDK re-derives tools/list from zod, which drops parameter
+    // descriptions and narrows types (integer → number). Serve OpenCode's
+    // own JSON Schema verbatim so Claude sees exactly what OpenCode defined.
+    const mcpServer = server.instance?.server;
+    if (typeof mcpServer?.setRequestHandler === "function") {
+      mcpServer.setRequestHandler(
+        z.object({ method: z.literal("tools/list"), params: z.any().optional() }),
+        async () => ({ tools: listed }),
+      );
+    }
 
     return { opencode: server };
   } catch (err) {
@@ -922,7 +1090,8 @@ async function collectTurnResponse(
 
   let content = "";
   let reasoning = "";
-  let turnUsage: OpenAIUsage | null = null;
+  const usageTracker = new TurnUsageTracker(bridge.seenAssistantUsageIds);
+  const mapState: MapState = { messageId: null };
   let resultUsage: OpenAIUsage | null = null;
   let lastErrorNorm: string | null = null;
   let errorText: string | null = null;
@@ -939,7 +1108,7 @@ async function collectTurnResponse(
 
   try {
     for await (const event of events) {
-      const mapped = mapSdkEvent(event);
+      const mapped = mapSdkEvent(event, mapState);
       if (mapped.kind === "park") {
         toolCalls.push(...mapped.tools);
         sawContent = true;
@@ -949,12 +1118,7 @@ async function collectTurnResponse(
       } else if (mapped.kind === "reasoning") {
         if (!suppressReasoning) reasoning += mapped.text;
       } else if (mapped.kind === "usage-delta") {
-        turnUsage = addUniqueAssistantUsage(
-          turnUsage,
-          mapped.usage,
-          mapped.messageId,
-          bridge.seenAssistantUsageIds,
-        );
+        usageTracker.add(mapped.usage, mapped.messageId);
       } else if (mapped.kind === "usage") {
         resultUsage = mapped.usage;
       } else if (mapped.kind === "error") {
@@ -972,7 +1136,7 @@ async function collectTurnResponse(
     noteError(message);
   }
 
-  const usage = resolveTurnUsage(turnUsage, resultUsage);
+  const usage = resolveTurnUsage(usageTracker.total(), resultUsage);
 
   // Buffered responses have not committed HTTP headers yet. Even if an agent
   // produced partial work first, preserve the real 429 so OpenCode starts its
@@ -1248,7 +1412,8 @@ function streamOpenAIResponse(
       });
 
       let finishReason: string | null = "stop";
-      let turnUsage: OpenAIUsage | null = null;
+      const usageTracker = new TurnUsageTracker(bridge.seenAssistantUsageIds);
+      const mapState: MapState = { messageId: null };
       let resultUsage: OpenAIUsage | null = null;
       let lastErrorNorm: string | null = null;
       const sendError = (text: string) => {
@@ -1294,7 +1459,7 @@ function streamOpenAIResponse(
 
       try {
         for await (const event of events) {
-          const mapped = mapSdkEvent(event);
+          const mapped = mapSdkEvent(event, mapState);
           if (mapped.kind === "park") {
             finishReason = "tool_calls";
             for (let i = 0; i < mapped.tools.length; i++) {
@@ -1362,12 +1527,7 @@ function streamOpenAIResponse(
           }
 
           if (mapped.kind === "usage-delta") {
-            turnUsage = addUniqueAssistantUsage(
-              turnUsage,
-              mapped.usage,
-              mapped.messageId,
-              bridge.seenAssistantUsageIds,
-            );
+            usageTracker.add(mapped.usage, mapped.messageId);
           }
 
           if (mapped.kind === "usage") {
@@ -1401,7 +1561,7 @@ function streamOpenAIResponse(
         finishReason = "stop";
       }
 
-      const usage = resolveTurnUsage(turnUsage, resultUsage);
+      const usage = resolveTurnUsage(usageTracker.total(), resultUsage);
       if (!streamClosed) {
         send({
           id: completionId,
@@ -1489,7 +1649,9 @@ function forgetDeadSession(conversationKey: string, errorText: string): void {
  * `assistant` message payloads repeat the same content after partials and
  * would double-print if both were forwarded.
  */
-function mapSdkEvent(event: unknown): MappedEvent {
+type MapState = { messageId: string | null };
+
+function mapSdkEvent(event: unknown, state?: MapState): MappedEvent {
   if (!event || typeof event !== "object") return { kind: "ignore" };
   const e = event as Record<string, unknown>;
 
@@ -1526,6 +1688,21 @@ function mapSdkEvent(event: unknown): MappedEvent {
   // stream_event / partial message deltas (authoritative while streaming)
   if (e.type === "stream_event" && e.event && typeof e.event === "object") {
     const ev = e.event as Record<string, unknown>;
+    // message_start opens an API call; message_delta carries its final
+    // usage (the assistant events only ever hold the opening snapshot).
+    if (ev.type === "message_start" && ev.message && typeof ev.message === "object") {
+      const message = ev.message as { id?: unknown; usage?: unknown };
+      const id = typeof message.id === "string" ? message.id : null;
+      if (state) state.messageId = id;
+      const usage = usageFromAnthropic(message.usage);
+      return usage ? { kind: "usage-delta", usage, messageId: id } : { kind: "ignore" };
+    }
+    if (ev.type === "message_delta") {
+      const usage = usageFromAnthropic(ev.usage);
+      return usage
+        ? { kind: "usage-delta", usage, messageId: state?.messageId ?? null }
+        : { kind: "ignore" };
+    }
     if (ev.type === "content_block_delta" && ev.delta && typeof ev.delta === "object") {
       const delta = ev.delta as Record<string, unknown>;
       if (delta.type === "text_delta" && typeof delta.text === "string") {

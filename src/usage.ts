@@ -49,11 +49,18 @@ function fromAnthropicUsage(usage: Record<string, unknown>): OpenAIUsage {
   const details: NonNullable<OpenAIUsage["prompt_tokens_details"]> = {};
   if (cached > 0) details.cached_tokens = cached;
   if (cacheWrite > 0) details.cache_write_tokens = cacheWrite;
+  const outputDetails = usage.output_tokens_details as
+    | Record<string, unknown>
+    | undefined;
+  const thinking = asNumber(outputDetails?.thinking_tokens);
   return {
     prompt_tokens: prompt,
     completion_tokens: completion,
     total_tokens: prompt + completion,
     ...(Object.keys(details).length ? { prompt_tokens_details: details } : {}),
+    ...(thinking > 0
+      ? { completion_tokens_details: { reasoning_tokens: thinking } }
+      : {}),
   };
 }
 
@@ -194,6 +201,76 @@ export function addOpenAIUsage(
       ? { completion_tokens_details: { reasoning_tokens: reasoning } }
       : {}),
   };
+}
+
+/** Stream-event usage (message_start / message_delta) as OpenAI usage. */
+export function usageFromAnthropic(usage: unknown): OpenAIUsage | null {
+  if (!usage || typeof usage !== "object") return null;
+  return fromAnthropicUsage(usage as Record<string, unknown>);
+}
+
+function maxUsage(a: OpenAIUsage, b: OpenAIUsage): OpenAIUsage {
+  const pick = (x?: number, y?: number) => Math.max(x ?? 0, y ?? 0);
+  const cached = pick(
+    a.prompt_tokens_details?.cached_tokens,
+    b.prompt_tokens_details?.cached_tokens,
+  );
+  const cacheWrite = pick(
+    a.prompt_tokens_details?.cache_write_tokens,
+    b.prompt_tokens_details?.cache_write_tokens,
+  );
+  const reasoning = pick(
+    a.completion_tokens_details?.reasoning_tokens,
+    b.completion_tokens_details?.reasoning_tokens,
+  );
+  const prompt = pick(a.prompt_tokens, b.prompt_tokens);
+  const completion = pick(a.completion_tokens, b.completion_tokens);
+  const promptDetails: NonNullable<OpenAIUsage["prompt_tokens_details"]> = {};
+  if (cached > 0) promptDetails.cached_tokens = cached;
+  if (cacheWrite > 0) promptDetails.cache_write_tokens = cacheWrite;
+  return {
+    prompt_tokens: prompt,
+    completion_tokens: completion,
+    total_tokens: prompt + completion,
+    ...(Object.keys(promptDetails).length
+      ? { prompt_tokens_details: promptDetails }
+      : {}),
+    ...(reasoning > 0
+      ? { completion_tokens_details: { reasoning_tokens: reasoning } }
+      : {}),
+  };
+}
+
+/**
+ * Per-HTTP-response usage, one entry per Anthropic API call. The SDK reports
+ * a call's usage several times: the assistant events carry the message_start
+ * snapshot (output_tokens ≈ 1-4) and only message_delta has the final
+ * output. Keeping the max per message id makes the final numbers win.
+ * `seen` spans continuations of one bridge, so a call already reported in an
+ * earlier response is not counted again.
+ */
+export class TurnUsageTracker {
+  private readonly byId = new Map<string, OpenAIUsage>();
+  private anonymous: OpenAIUsage | null = null;
+
+  constructor(private readonly seen: Set<string>) {}
+
+  add(usage: OpenAIUsage, messageId: string | null): void {
+    if (!messageId) {
+      this.anonymous = addOpenAIUsage(this.anonymous, usage);
+      return;
+    }
+    const current = this.byId.get(messageId);
+    if (!current && this.seen.has(messageId)) return;
+    this.seen.add(messageId);
+    this.byId.set(messageId, current ? maxUsage(current, usage) : usage);
+  }
+
+  total(): OpenAIUsage | null {
+    let sum = this.anonymous ? { ...this.anonymous } : null;
+    for (const usage of this.byId.values()) sum = addOpenAIUsage(sum, usage);
+    return sum;
+  }
 }
 
 /** Count a replayed SDK assistant message only once across tool continuations. */

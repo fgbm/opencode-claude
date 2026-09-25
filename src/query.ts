@@ -161,6 +161,14 @@ export type StartClaudeQueryParams = {
   autoCompactEnabled?: boolean;
   /** Stop utility queries such as title generation after one model turn. */
   maxTurns?: number;
+  /** false keeps one-shot utility turns out of ~/.claude/projects history. */
+  persistSession?: boolean;
+  /**
+   * Isolate a one-shot turn from every MCP server the user configured,
+   * including claude.ai cloud connectors, so none of their tool definitions
+   * ride along.
+   */
+  isolateMcp?: boolean;
   /** Thinking config; defaults to adaptive when effort is set. */
   thinking?:
     | { type: "adaptive" }
@@ -237,6 +245,13 @@ export async function startClaudeQuery(
 
   if (params.autoCompactEnabled !== false) {
     options.autoCompactEnabled = true;
+  }
+
+  if (params.persistSession === false) options.persistSession = false;
+
+  if (params.isolateMcp === true) {
+    options.strictMcpConfig = true;
+    options.settings = { disableClaudeAiConnectors: true };
   }
 
   if (Number.isInteger(params.maxTurns) && Number(params.maxTurns) > 0) {
@@ -360,4 +375,49 @@ export async function startClaudeQuery(
   };
 
   return { stream: result as AsyncIterable<unknown>, interrupt, close, getPid };
+}
+
+/**
+ * Ask the local CLI which models this account can use. Starts a Claude Code
+ * process with no prompt: no model call is made and nothing is persisted.
+ */
+export async function listClaudeSupportedModels(
+  timeoutMs = 20_000,
+): Promise<unknown[] | null> {
+  const sdk = await loadClaudeAgentSdk();
+  const queryFn = (sdk as { query?: Function }).query;
+  if (typeof queryFn !== "function") return null;
+  let release: () => void = () => {};
+  const idle = (async function* () {
+    await new Promise<void>((resolve) => {
+      release = resolve;
+    });
+  })();
+  const env = buildClaudeCodeChildEnv(process.env);
+  const pathToClaudeCodeExecutable = resolveClaudeCodeExecutable({ env });
+  const q = queryFn({
+    prompt: idle,
+    options: {
+      env,
+      persistSession: false,
+      settingSources: [],
+      strictMcpConfig: true,
+      settings: { disableClaudeAiConnectors: true },
+      ...(pathToClaudeCodeExecutable ? { pathToClaudeCodeExecutable } : {}),
+    },
+  }) as { supportedModels?: () => Promise<unknown[]>; close?: () => void };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    if (typeof q.supportedModels !== "function") return null;
+    return await Promise.race([
+      q.supportedModels(),
+      new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+    release();
+    q.close?.();
+  }
 }

@@ -4,7 +4,11 @@
  */
 import { extractTextContent } from "./prompt.js";
 
-export type MetaRequestKind = "title" | "summary" | null;
+/**
+ * `generate` is a stateless one-shot generation (OpenCode's
+ * /api/experimental/generate): no session, no tools, no user context.
+ */
+export type MetaRequestKind = "title" | "summary" | "generate" | null;
 
 type MessageLike = {
   role?: string;
@@ -73,5 +77,6 @@ export function detectMetaRequestKind(
 export function requestKeyNamespace(kind: MetaRequestKind): string {
   if (kind === "title") return "title:";
   if (kind === "summary") return "summary:";
+  if (kind === "generate") return "generate:";
   return "";
 }

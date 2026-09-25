@@ -1,5 +1,43 @@
 # Changelog
 
+## 1.0.0 - 2026-09-25
+
+Requires OpenCode 2.x. OpenCode 1.x users stay on 0.14.
+
+- **OpenCode 2.x plugin API**: the provider, its models, the sign-in button
+  and request headers are registered through the v2 `{ id, setup }` API. No
+  provider block is needed in `opencode.json`; register the plugin under
+  `plugins`. `{ "options": { "debug": true } }` turns on the debug log.
+- **Model list from Claude Code itself**: models come from the CLI's
+  `supportedModels()` for the signed-in account (Opus 5.5, Fable 5.1, Sonnet 5,
+  Opus 4.x, Haiku…), cached for the next start. 1M context variants follow the
+  same per-family rules as t3code, and effort variants only appear where the
+  model accepts them. Ids from earlier versions keep working.
+- **Fix: tools lost their parameters**: tool schemas went through a lossy
+  JSON Schema → zod conversion, so Claude saw no parameter descriptions, no
+  nested fields and no enums, and unknown arguments were dropped. OpenCode's
+  schemas now reach Claude verbatim and arguments reach OpenCode intact.
+- **Fix: output tokens were undercounted**: usage came from the opening
+  snapshot of each API call (output ≈ 1-4 tokens); the final `message_delta`
+  count now wins, and thinking tokens are reported separately. Turn stats in
+  OpenCode/OpenChamber now show real numbers.
+- **Plan-only**: turns are refused when the CLI is signed in with an API key
+  or routed to Bedrock/Vertex/Foundry; API keys belong to OpenCode's built-in
+  Anthropic provider.
+- **Less quota per turn**: chat turns get only OpenCode's tools — the user's
+  Claude Code MCP servers and claude.ai connectors are no longer attached.
+  Titles and compaction summaries run on Haiku, isolated and unsaved, and a
+  compaction starts a fresh Claude session from the compacted history.
+- **Stateless generation**: `/api/experimental/generate` requests (no session)
+  run as one clean turn: no tools, no user context, nothing persisted.
+- **No stray sessions**: title/summary/generate turns no longer land in the
+  Claude Code history (`claude --resume`).
+- **Security: loopback proxy refuses browser requests**: requests carrying an
+  `Origin` header or a non-loopback `Host` get 403, so a web page cannot spend
+  the subscription through CSRF or DNS rebinding.
+- Per-run token usage (`turn usage`) is written to the debug log.
+- README no longer implies Anthropic endorsement.
+
 ## 0.13.1 - 2026-08-18
 
 - **Fix: turn stall watchdog** — a Claude turn that went totally silent (dead

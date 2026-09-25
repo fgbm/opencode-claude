@@ -12,11 +12,13 @@
 
 Use Claude from [OpenCode](https://opencode.ai) and [OpenChamber](https://github.com/openchamber/openchamber) without an Anthropic API key. The plugin runs the official Anthropic Agent SDK plus the local `claude` CLI and proxies an OpenAI-compatible `/v1/chat/completions` surface into OpenCode. Claude Code owns authentication; the plugin never reads, copies, refreshes, or sends your credentials itself.
 
-### Official Claude runtime
+### How it talks to Claude
 
-**Built on Anthropic's official Agent SDK and Claude Code authentication flow. Designed for local, user-operated Claude Code usage.**
+**Uses the official Claude Agent SDK, as described in Anthropic's guide to [using the Agent SDK with your Claude plan](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan). Designed for local, single-user use.**
 
-No OAuth tokens are extracted, copied, stored, injected, or sent by this plugin. All authentication and model access are performed internally by the official Claude Code runtime. The plugin does not call Anthropic inference endpoints directly and does not impersonate Anthropic API clients.
+No OAuth tokens are extracted, copied, stored, injected, or sent by this plugin. All authentication and model access are performed by your locally installed Claude Code CLI. The plugin does not call Anthropic endpoints directly and does not impersonate Anthropic clients.
+
+This is an independent community project. It is not affiliated with, endorsed by, or supported by Anthropic. Claude and Claude Code are trademarks of Anthropic.
 
 Sibling plugins: [@openchamber/opencode-cursor](https://github.com/openchamber/opencode-cursor) and [@openchamber/opencode-commandcode](https://github.com/openchamber/opencode-commandcode).
 
@@ -57,12 +59,10 @@ npm install -g @openchamber/opencode-claude
 Or with OpenCode:
 
 ```bash
-# global (recommended)
-opencode plugin @openchamber/opencode-claude -g
-
-# or project-local (writes .opencode/opencode.json)
-opencode plugin @openchamber/opencode-claude
+opencode plugin add @openchamber/opencode-claude
 ```
+
+Requires OpenCode 2.x. OpenCode 1.x users stay on `@openchamber/opencode-claude@0.14`.
 
 ### 2. Register it in OpenCode
 
@@ -70,19 +70,17 @@ Add (or merge) this into `~/.config/opencode/opencode.json`:
 
 ```jsonc
 {
-  "$schema": "https://opencode.ai/config.json",
-  "plugin": ["@openchamber/opencode-claude"],
-  "provider": {
-    "claude-code": { "name": "Claude Code" }
-  }
+  "plugins": ["@openchamber/opencode-claude"]
 }
 ```
+
+The plugin registers the **Claude Code** provider and its models itself; no provider block is needed.
 
 ### 3. Authenticate
 
 ```bash
-claude auth login
-opencode auth login --provider claude-code
+claude auth login --claudeai
+opencode auth login claude-code
 # pick "Sign in with Claude Code CLI"
 ```
 
@@ -164,7 +162,7 @@ Debug logging: `OPENCODE_CLAUDE_DEBUG=1`.
 
 Optional knobs:
 
-- `OPENCODE_CLAUDE_PROXY_PORT` — optional pinned proxy port (default: ephemeral / OS-assigned; live URL is published to OpenCode via plugin config)
+- `OPENCODE_CLAUDE_PROXY_PORT` — optional pinned proxy port (default: ephemeral / OS-assigned; live URL is published to OpenCode on every request)
 - `OPENCODE_CLAUDE_CWD` — working directory passed to the Agent SDK
 - `OPENCODE_CLAUDE_RATE_LIMIT_FAST_FAIL` — `0` disables the 429 rate-limit gate
 - `OPENCODE_CLAUDE_RATE_LIMIT_STORE` — override the rate-limit store path (tests)

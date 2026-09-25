@@ -40,6 +40,13 @@ export function interpretClaudeAuthStatus(payload: unknown): {
     return { loggedIn: false, detail: "auth-status-logged-out", authMethod };
   }
 
+  // Bedrock / Vertex / Foundry bill through the cloud account, not the plan.
+  const apiProvider =
+    typeof root.apiProvider === "string" ? root.apiProvider.trim() : "";
+  if (apiProvider && apiProvider !== "firstParty") {
+    return { loggedIn: false, detail: "third-party-provider", authMethod };
+  }
+
   if (
     normalized === "none" ||
     normalized.includes("api") ||
@@ -98,6 +105,52 @@ export function probeClaudeAuthStatusCli(options: {
   } catch {
     return null;
   }
+}
+
+const SUBSCRIPTION_CHECK_TTL_MS = 60_000;
+let subscriptionCheck: { at: number; result: Promise<string | null> } | null =
+  null;
+
+/**
+ * The plugin serves Claude plans only: API-key access already has a native
+ * OpenCode provider. Returns a user-facing refusal when the CLI is signed in
+ * some other way, or null when the turn may run. Unknown probe results fail
+ * open so a slow CLI never blocks subscription users; a signed-out CLI fails
+ * on its own with an auth error. Cached briefly to keep turns fast.
+ */
+type AuthStatusProbe = () => { loggedIn: boolean; detail: string } | null;
+
+const defaultAuthStatusProbe: AuthStatusProbe = () => {
+  const binaryPath = resolveClaudeCli(process.env);
+  return binaryPath ? probeClaudeAuthStatusCli({ binaryPath }) : null;
+};
+let authStatusProbe = defaultAuthStatusProbe;
+
+/** Test seam: replace the CLI probe (null restores the real one). */
+export function setAuthStatusProbe(probe: AuthStatusProbe | null): void {
+  authStatusProbe = probe ?? defaultAuthStatusProbe;
+  subscriptionCheck = null;
+}
+
+export function checkSubscriptionAuth(
+  now = Date.now(),
+): Promise<string | null> {
+  const probe = authStatusProbe;
+  if (subscriptionCheck && now - subscriptionCheck.at < SUBSCRIPTION_CHECK_TTL_MS) {
+    return subscriptionCheck.result;
+  }
+  const result = Promise.resolve().then(() => {
+    const status = probe();
+    if (status?.detail === "api-key-only") {
+      return "Claude Code CLI is signed in with an API key. This provider works only with a Claude plan; use OpenCode's built-in Anthropic provider for API keys, or run `claude auth login --claudeai`.";
+    }
+    if (status?.detail === "third-party-provider") {
+      return "Claude Code CLI is set to use Bedrock, Vertex or another cloud provider. This provider works only with a Claude plan signed in via `claude auth login --claudeai`.";
+    }
+    return null;
+  });
+  subscriptionCheck = { at: now, result };
+  return result;
 }
 
 export async function detectClaudeCode(options?: {

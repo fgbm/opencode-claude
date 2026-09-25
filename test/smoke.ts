@@ -6,12 +6,17 @@ import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 
 async function main() {
+  // Keep the user's real plugin data (session bindings, debug log) untouched.
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  process.env.XDG_DATA_HOME = mkdtempSync(`${tmpdir()}/opencode-claude-smoke-`);
   const { buildClaudeCodeChildEnv } = await import("../src/auth-env.ts");
   const {
     interpretClaudeAuthStatus,
   } = await import("../src/detect.ts");
   const {
-    CLAUDE_CODE_MODELS,
+    modelsFromSdk,
+    setDiscoveredModels,
     buildEffortVariants,
     getClaudeModels,
     resolveClaudeModelId,
@@ -32,6 +37,8 @@ async function main() {
     buildAuthMethods,
     manualInstallResponse,
     ClaudeCodePlugin,
+    buildProviderInfo,
+    buildClaudeProviderModels,
   } = await import("../src/index.ts");
   const {
     startProxy,
@@ -39,7 +46,135 @@ async function main() {
     getProxyPort,
     getClaudeProxyBaseUrl,
     PROXY_IDLE_TIMEOUT_SECONDS,
+    isTrustedLocalRequest,
+    buildOpenCodeMcpServer,
+    resolveMetaKind,
   } = await import("../src/proxy.ts");
+
+  // One-shot turns reach the SDK isolated from user MCP and connectors
+  {
+    const { startClaudeQuery } = await import("../src/query.ts");
+    let seen: any;
+    await startClaudeQuery({
+      prompt: "x",
+      cwd: process.cwd(),
+      isolateMcp: true,
+      persistSession: false,
+      queryImpl: () => (input: any) => {
+        seen = input.options;
+        return (async function* () {})();
+      },
+    } as any);
+    assert.equal(seen.strictMcpConfig, true);
+    assert.deepEqual(seen.settings, { disableClaudeAiConnectors: true });
+    assert.equal(seen.persistSession, false);
+  }
+
+  // Usage: the final message_delta count wins over the opening snapshot
+  {
+    const { TurnUsageTracker, usageFromAnthropic } = await import("../src/usage.ts");
+    const seen = new Set<string>();
+    const tracker = new TurnUsageTracker(seen);
+    const start = usageFromAnthropic({ input_tokens: 8, cache_read_input_tokens: 800, output_tokens: 4 })!;
+    const final = usageFromAnthropic({ input_tokens: 8, cache_read_input_tokens: 800, output_tokens: 191, output_tokens_details: { thinking_tokens: 112 } })!;
+    tracker.add(start, "msg_1");
+    tracker.add(start, "msg_1");
+    tracker.add(final, "msg_1");
+    tracker.add(start, "msg_1");
+    tracker.add(usageFromAnthropic({ input_tokens: 2, output_tokens: 50 })!, "msg_2");
+    const total = tracker.total()!;
+    assert.equal(total.completion_tokens, 241);
+    assert.equal(total.prompt_tokens, 810);
+    assert.equal(total.prompt_tokens_details?.cached_tokens, 800);
+    assert.equal(total.completion_tokens_details?.reasoning_tokens, 112);
+    // A continuation response does not recount calls reported earlier
+    const next = new TurnUsageTracker(seen);
+    next.add(final, "msg_1");
+    assert.equal(next.total(), null);
+  }
+
+  // Request kinds: hooked session requests vs stateless generation
+  {
+    const plain = [{ role: "user", content: "Write a commit message" }];
+    assert.equal(resolveMetaKind("primary", "ses_1", plain as any), null);
+    assert.equal(resolveMetaKind("title", "ses_1", plain as any), "title");
+    assert.equal(resolveMetaKind("compaction", "ses_1", plain as any), "summary");
+    assert.equal(resolveMetaKind("generate", "ses_1", plain as any), "generate");
+    // /api/experimental/generate bypasses session hooks: no plugin headers
+    assert.equal(resolveMetaKind(null, null, plain as any), "generate");
+  }
+
+  // Tool schemas reach Claude verbatim; unnamed args still reach OpenCode
+  {
+    const parameters = {
+      type: "object",
+      properties: {
+        filePath: { type: "string", description: "Absolute path" },
+        mode: { type: "string", enum: ["a", "b"] },
+        edits: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: { old: { type: "string" }, new: { type: "string" } },
+            required: ["old", "new"],
+          },
+        },
+        limit: { type: "integer", minimum: 1 },
+      },
+      required: ["filePath"],
+    };
+    const parked = new Map<string, any>();
+    const servers: any = await buildOpenCodeMcpServer(
+      [{ type: "function", function: { name: "edit", description: "Edit a file", parameters } }] as any,
+      parked,
+      () => {
+        for (const call of parked.values()) call.resolve("done");
+      },
+    );
+    const handlers = servers.opencode.instance.server._requestHandlers;
+    const listed = await handlers.get("tools/list")({ method: "tools/list", params: {} }, {});
+    assert.deepEqual(listed.tools[0].inputSchema, parameters);
+    await handlers.get("tools/call")(
+      {
+        method: "tools/call",
+        params: { name: "edit", arguments: { filePath: "/a", extra: 1, edits: [{ old: "x", new: "y" }] } },
+      },
+      { signal: new AbortController().signal, sendNotification: async () => {}, sendRequest: async () => {} },
+    );
+    const sent = JSON.parse([...parked.values()][0].arguments);
+    assert.deepEqual(sent, { filePath: "/a", extra: 1, edits: [{ old: "x", new: "y" }] });
+  }
+
+  // Plan-only gate: API-key and cloud-provider CLI logins are refused
+  const { setAuthStatusProbe, checkSubscriptionAuth } =
+    await import("../src/detect.ts");
+  assert.equal(
+    interpretClaudeAuthStatus({ loggedIn: true, authMethod: "claude.ai", apiProvider: "firstParty" }).loggedIn,
+    true,
+  );
+  assert.equal(
+    interpretClaudeAuthStatus({ loggedIn: true, authMethod: "claude.ai", apiProvider: "bedrock" }).detail,
+    "third-party-provider",
+  );
+  setAuthStatusProbe(() => ({ loggedIn: false, detail: "api-key-only" }));
+  assert.match(String(await checkSubscriptionAuth()), /API key/);
+  setAuthStatusProbe(() => ({ loggedIn: true, detail: "auth-status-oauth" }));
+  assert.equal(await checkSubscriptionAuth(), null);
+  // Remaining proxy tests run against a signed-in plan.
+
+  // Browser pages must not reach the loopback proxy (CSRF / DNS rebinding)
+  const probe = (headers: Record<string, string>) =>
+    isTrustedLocalRequest(
+      new Request("http://127.0.0.1:1/v1/models", { headers }),
+    );
+  assert.equal(probe({ host: "127.0.0.1:4096" }), true);
+  assert.equal(probe({ host: "localhost:4096" }), true);
+  assert.equal(probe({ host: "[::1]:4096" }), true);
+  assert.equal(
+    probe({ host: "127.0.0.1:4096", origin: "https://evil.example" }),
+    false,
+  );
+  assert.equal(probe({ host: "rebind.evil.example:4096" }), false);
 
   // Auth env stripping
   const cleaned = buildClaudeCodeChildEnv({
@@ -331,19 +466,42 @@ async function main() {
   assert.equal(resolveClaudeModelId("haiku"), "claude-haiku-4-5");
   assert.equal(resolveClaudeModelId("sonnet"), "sonnet");
 
-  const sonnet = CLAUDE_CODE_MODELS.find((m) => m.id === "sonnet")!;
+  const sonnet = getClaudeModels().find((m) => m.id === "sonnet")!;
   const variants = buildEffortVariants(sonnet);
-  for (const level of EFFORT_LEVELS) {
-    assert.ok(variants[level]);
-    assert.equal(isClaudeEffort(level), true);
-    assert.ok(
-      variants[level] &&
-        typeof variants[level] === "object" &&
-        "effort" in variants[level],
+  assert.deepEqual(variants, [...EFFORT_LEVELS]);
+  for (const level of EFFORT_LEVELS) assert.equal(isClaudeEffort(level), true);
+  assert.equal(sonnet.contextWindow, 200_000);
+  // Haiku takes no effort, so it gets no effort variants
+  assert.deepEqual(
+    buildEffortVariants(getClaudeModels().find((m) => m.id === "haiku")!),
+    [],
+  );
+
+  // The CLI's own model list becomes the catalog, with t3code's 1M rules
+  {
+    const fromCli = modelsFromSdk([
+      { value: "default", displayName: "Default (recommended)", resolvedModel: "claude-opus-5-5", supportedEffortLevels: ["low", "high"] },
+      { value: "opus", displayName: "Opus 5.5", resolvedModel: "claude-opus-5-5", supportedEffortLevels: ["low", "high"] },
+      { value: "sonnet", displayName: "Sonnet 5", resolvedModel: "claude-sonnet-5", supportedEffortLevels: ["low", "high"] },
+      { value: "claude-opus-4-8", displayName: "Opus 4.8", resolvedModel: "claude-opus-4-8" },
+      { value: "haiku", displayName: "Haiku 4.5", resolvedModel: "claude-haiku-4-5-20251001" },
+    ]);
+    const byId = Object.fromEntries(fromCli.map((m) => [m.id, m]));
+    assert.deepEqual(
+      fromCli.map((m) => m.id),
+      ["opus[1m]", "sonnet", "sonnet[1m]", "claude-opus-4-8", "haiku"],
     );
+    assert.equal(byId["opus[1m]"]!.contextWindow, 1_000_000);
+    assert.deepEqual(buildEffortVariants(byId["opus[1m]"]!), ["low", "high"]);
+    assert.equal(byId["sonnet"]!.contextWindow, 200_000);
+    assert.equal(byId["sonnet[1m]"]!.name, "Sonnet 5 (1M)");
+    assert.equal(byId["claude-opus-4-8"]!.contextWindow, 1_000_000);
+    assert.deepEqual(buildEffortVariants(byId["haiku"]!), []);
+    assert.equal(setDiscoveredModels(fromCli), true);
+    const ids = getClaudeModels().map((m) => m.id);
+    assert.ok(ids.includes("fable"), "old ids stay resolvable for saved sessions");
+    assert.equal(setDiscoveredModels(fromCli), false, "unchanged list is not a change");
   }
-  assert.deepEqual(variants.none, { disabled: true });
-  assert.deepEqual(variants.minimal, { disabled: true });
   assert.equal(isClaudeEffort("nope"), false);
 
   const selection = resolveClaudeModelSelection("sonnet", "high");
@@ -719,7 +877,7 @@ async function main() {
     const { readFileSync, unlinkSync, existsSync } = await import("node:fs");
     const { join } = await import("node:path");
     const { homedir } = await import("node:os");
-    const logPath = join(homedir(), ".local", "share", "opencode-claude", "debug.log");
+    const logPath = join(process.env.XDG_DATA_HOME!, "opencode-claude", "debug.log");
     if (existsSync(logPath)) unlinkSync(logPath);
 
     const off = spawnSync(
@@ -760,7 +918,21 @@ async function main() {
   }
 
   // Plugin export
-  assert.equal(typeof ClaudeCodePlugin, "function");
+  assert.equal(ClaudeCodePlugin.id, "openchamber.claude-code");
+  assert.equal(typeof ClaudeCodePlugin.setup, "function");
+  {
+    const info: any = buildProviderInfo("http://127.0.0.1:1/v1");
+    assert.equal(info.activation, "enabled");
+    assert.equal(info.package, "@opencode/ai/providers/openai-compatible");
+    assert.equal(info.settings.baseURL, "http://127.0.0.1:1/v1");
+    const listed: any[] = buildClaudeProviderModels(getClaudeModels());
+    const sonnetModel = listed.find((m) => m.id === "sonnet");
+    assert.deepEqual(
+      sonnetModel.variants.map((v: any) => v.id),
+      buildEffortVariants(getClaudeModels().find((m) => m.id === "sonnet")!),
+    );
+    assert.deepEqual(sonnetModel.capabilities.input, ["text", "image", "pdf"]);
+  }
 
   // Auth methods mirror CLI presence: install only when missing, relay only
   // when present, and every path carries the terminal alternative. The method
@@ -768,23 +940,24 @@ async function main() {
   // method would run a real `npm install -g` — so the terminal fallback is
   // exercised through its pure builder instead.
   {
-    const withoutCli = buildAuthMethods(false, "/tmp");
+    const withoutCli: any[] = buildAuthMethods(false, "/tmp");
     assert.equal(withoutCli.length, 1);
+    assert.equal(withoutCli[0].integrationID, "claude-code");
     assert.equal(
-      withoutCli[0]!.label,
+      withoutCli[0].method.label,
       "Install Claude Code CLI and sign in",
     );
 
-    const withCli = buildAuthMethods(true, "/tmp");
+    const withCli: any[] = buildAuthMethods(true, "/tmp");
     assert.equal(withCli.length, 1);
-    assert.equal(withCli[0]!.label, "Sign in with Claude Code CLI");
+    assert.equal(withCli[0].method.label, "Sign in with Claude Code CLI");
 
     // The fallback instructions always name both the install and the auth
     // command, whatever the launch failure message was.
-    const fallback = manualInstallResponse("boom");
+    const fallback = manualInstallResponse("boom", "claude-cli");
     assert.match(fallback.instructions, /npm install -g @anthropic-ai\/claude-code/);
     assert.match(fallback.instructions, /claude auth login --claudeai/);
-    assert.equal(fallback.method, "auto");
+    assert.equal(fallback.mode, "auto");
   }
 
   const requestHeaders: Record<string, string> = {};
@@ -879,6 +1052,10 @@ async function main() {
       assert.deepEqual(titleOptions!.settingSources, []);
       assert.deepEqual(titleOptions!.skills, []);
       assert.equal(titleOptions!.maxTurns, 1);
+      assert.equal(titleOptions!.model, "claude-haiku-4-5");
+      assert.equal(titleOptions!.effort, undefined);
+      assert.equal(titleOptions!.persistSession, false);
+      assert.equal(titleOptions!.isolateMcp, true);
       assert.equal(titleOptions!.autoCompactEnabled, false);
       assert.deepEqual(titleOptions!.thinking, { type: "disabled" });
       assert.equal(titleOptions!.resume, undefined);
