@@ -32,6 +32,10 @@ import {
 } from "./model-selection.js";
 import { getClaudeModels, resolveClaudeModelId } from "./models.js";
 import {
+  openCodeSystemContext,
+  systemContextForwardingEnabled,
+} from "./system-context.js";
+import {
   DIRECTORY_HEADER,
   KIND_HEADER,
   SESSION_HEADER,
@@ -1095,7 +1099,12 @@ async function handleChatCompletions(
           ].join(" "),
         ]
       : []),
-  ].join("\n\n");
+    ...(!isMetaRequest && systemContextForwardingEnabled()
+      ? [openCodeSystemContext(messages)]
+      : []),
+  ]
+    .filter(Boolean)
+    .join("\n\n");
   // Generation is an explicit model choice by the caller; keep it.
   const queryModel =
     metaKind === "title" || metaKind === "summary" ? META_REQUEST_MODEL : model;
