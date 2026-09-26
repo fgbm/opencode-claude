@@ -973,7 +973,11 @@ async function handleChatCompletions(
       ? await buildOpenCodeMcpServer(openCodeTools, pendingTools, notifyPark)
       : undefined;
 
-  const bridgeOpenCodeTools = !isMetaRequest && openCodeTools.length > 0;
+  // buildOpenCodeMcpServer logs and returns undefined on failure. Bridging
+  // anyway would disable the built-in tools with no mcp__opencode__* ones
+  // registered, so fall back to Claude Code's own tools instead.
+  const bridgeOpenCodeTools =
+    !isMetaRequest && openCodeTools.length > 0 && mcpServers !== undefined;
   const openCodeToolNames = openCodeTools
     .map((t) => t.function?.name)
     .filter((n): n is string => typeof n === "string" && n.length > 0);
