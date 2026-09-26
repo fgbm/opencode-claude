@@ -16,18 +16,22 @@ export type ClaudeModel = {
   reasoning: boolean;
   contextWindow: number;
   maxTokens: number;
+  /** Input cap OpenCode schedules auto-compaction against (input − reserved). */
+  inputWindow?: number;
   resolvedId?: string;
   /** Effort levels the model accepts; defaults to all when reasoning. */
   efforts?: ClaudeEffort[];
 };
 
-const LIMIT_1M = { context: 1_000_000, output: 128_000 } as const;
+// Without an input cap OpenCode compacts at context − output, i.e. at the very
+// edge of a 1M window; 900k moves it to ~90%, like Claude Code's own trigger.
+const LIMIT_1M = { context: 1_000_000, input: 900_000, output: 128_000 } as const;
 const LIMIT_200K = { context: 200_000, output: 64_000 } as const;
 
 function model(
   id: string,
   name: string,
-  limit: { context: number; output: number },
+  limit: { context: number; input?: number; output: number },
   resolvedId?: string,
   efforts: ClaudeEffort[] = [...EFFORT_LEVELS],
 ): ClaudeModel {
@@ -37,6 +41,7 @@ function model(
     reasoning: efforts.length > 0,
     contextWindow: limit.context,
     maxTokens: limit.output,
+    ...(limit.input ? { inputWindow: limit.input } : {}),
     efforts,
     ...(resolvedId ? { resolvedId } : {}),
   };

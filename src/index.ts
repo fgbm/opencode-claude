@@ -79,7 +79,11 @@ export function buildProviderModel(model: ClaudeModel, id: string): ModelInfo {
     cost: [],
     status: "active",
     enabled: true,
-    limit: { context: model.contextWindow, output: model.maxTokens },
+    limit: {
+      context: model.contextWindow,
+      ...(model.inputWindow ? { input: model.inputWindow } : {}),
+      output: model.maxTokens,
+    },
   } as unknown as ModelInfo;
 }
 

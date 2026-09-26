@@ -571,6 +571,10 @@ async function main() {
     assert.equal(byId["claude-sonnet-5"]!.contextWindow, 200_000);
     assert.equal(byId["claude-sonnet-5[1m]"]!.name, "Sonnet 5 (1M)");
     assert.equal(byId["claude-opus-4-8"]!.contextWindow, 1_000_000);
+    // 1M models declare an input cap so OpenCode compacts before the edge
+    assert.equal(byId["claude-opus-5-5[1m]"]!.inputWindow, 900_000);
+    assert.equal(byId["claude-sonnet-5[1m]"]!.inputWindow, 900_000);
+    assert.equal(byId["claude-sonnet-5"]!.inputWindow, undefined);
     assert.deepEqual(buildEffortVariants(byId["claude-haiku-4-5-20251001"]!), []);
     assert.equal(setDiscoveredModels(fromCli), true);
     const ids = getClaudeModels().map((m) => m.id);
@@ -1218,6 +1222,12 @@ async function main() {
       buildEffortVariants(getClaudeModels().find((m) => m.id === "claude-sonnet-5")!),
     );
     assert.deepEqual(sonnetModel.capabilities.input, ["text", "image", "pdf"]);
+    assert.deepEqual(sonnetModel.limit, { context: 200_000, output: 64_000 });
+    assert.deepEqual(listed.find((m) => m.id === "claude-opus-5-5[1m]").limit, {
+      context: 1_000_000,
+      input: 900_000,
+      output: 128_000,
+    });
   }
 
   // Auth methods mirror CLI presence: install only when missing, relay only
