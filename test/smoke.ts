@@ -51,7 +51,19 @@ async function main() {
     isTrustedLocalRequest,
     buildOpenCodeMcpServer,
     resolveMetaKind,
+    looksLikeToolError,
   } = await import("../src/proxy.ts");
+
+  // Tool errors are counted in the usage log in both OpenCode formats
+  assert.equal(looksLikeToolError("Error: boom"), true);
+  assert.equal(
+    looksLikeToolError(
+      '{"error":{"type":"tool.execution","message":"File not found: /a.ts"},"content":[]}',
+    ),
+    true,
+  );
+  assert.equal(looksLikeToolError('{"error":"none","items":[]}'), false);
+  assert.equal(looksLikeToolError("plain output"), false);
 
   // One-shot turns reach the SDK isolated from user MCP and connectors
   {

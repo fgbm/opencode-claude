@@ -2278,11 +2278,13 @@ function presentToolBlocks(
  */
 const DEFERRABLE_TOOLS = new Set(["webfetch", "websearch", "subagent"]);
 
-function looksLikeToolError(text: string): boolean {
+export function looksLikeToolError(text: string): boolean {
   const head = text.slice(0, 240);
   return (
     /^(Error:|error:|\[error\]|Tool error)/.test(head) ||
-    /"isError"\s*:\s*true/.test(head)
+    /"isError"\s*:\s*true/.test(head) ||
+    // OpenCode 2: {"error":{"type":"tool.execution","message":...},"content":[]}
+    /^\s*\{\s*"error"\s*:\s*\{\s*"type"\s*:\s*"tool\./.test(head)
   );
 }
 
