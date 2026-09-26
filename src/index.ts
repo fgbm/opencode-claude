@@ -43,6 +43,7 @@ import {
   getClaudeProxyBaseUrl,
   retainProxy,
   startProxy,
+  teardownSessionBridges,
 } from "./proxy.js";
 
 export function applyClaudeRequestContextHeaders(
@@ -207,11 +208,40 @@ export const ClaudeCodePlugin: Plugin.Plugin = {
       });
     });
 
+    const events = new AbortController();
+    void closeTurnsOnSessionIdle(ctx.event, events.signal);
+
     // The proxy is shared by every location in the process; unloading this
     // one only stops it when no other location still holds it.
-    return retainProxy();
+    const releaseProxy = retainProxy();
+    return async () => {
+      events.abort();
+      await releaseProxy();
+    };
   },
 };
+
+/**
+ * OpenCode publishes `session.idle` when a run ends, including an aborted
+ * one. A turn still parked on a tool at that point was abandoned.
+ */
+async function closeTurnsOnSessionIdle(
+  events: Plugin.Context["event"],
+  signal: AbortSignal,
+): Promise<void> {
+  try {
+    for await (const event of events.subscribe({ signal })) {
+      if (event.type !== "session.idle") continue;
+      teardownSessionBridges(event.data.sessionID);
+    }
+  } catch (err) {
+    if (signal.aborted) return;
+    log.warn(
+      "[opencode-claude] session event stream ended; aborted turns wait for the park TTL",
+      err instanceof Error ? err.message : err,
+    );
+  }
+}
 
 const INSTALL_METHOD_ID = "claude-cli-install";
 const SIGN_IN_METHOD_ID = "claude-cli";

@@ -284,6 +284,8 @@ type ProxyRuntime = {
   port: number | null;
   users: number;
   stopOwner: (() => void) | null;
+  /** The owner's teardown for one session's parked turns (same pool). */
+  teardownOwnerSession: ((sessionID: string) => string[]) | null;
 };
 
 const SHARED_PROXY_KEY = Symbol.for("opencode-claude.proxy.runtime");
@@ -297,7 +299,36 @@ function sharedProxyRuntime(): ProxyRuntime {
     port: null,
     users: 0,
     stopOwner: null,
+    teardownOwnerSession: null,
   });
+}
+
+function teardownLocalSession(sessionID: string): string[] {
+  const tornDown: string[] = [];
+  for (const kind of [null, "title", "summary"] as const) {
+    const key = requestKeyNamespace(kind) + sessionID;
+    const bridge = findBridgeByConversation(key);
+    if (!bridge) continue;
+    log.info("[opencode-claude] session went idle with a live bridge, closing it", {
+      conversationKey: key,
+      pending: bridge.pendingTools.size,
+    });
+    deleteBridge(bridge.id);
+    tornDown.push(key);
+  }
+  return tornDown;
+}
+
+/**
+ * Close the turns still live for a session OpenCode reports idle. An abort
+ * while a turn is parked on a tool leaves no open request whose cancel()
+ * could clean up, so the CLI child would otherwise wait out the park TTL.
+ * Normal turns delete their bridge before idle, so this is a no-op for them.
+ * Returns the conversation keys that were closed.
+ */
+export function teardownSessionBridges(sessionID: string): string[] {
+  const owner = sharedProxyRuntime().teardownOwnerSession ?? teardownLocalSession;
+  return owner(sessionID);
 }
 
 /** Injectable for smoke tests — production path always uses startClaudeQuery. */
@@ -392,6 +423,7 @@ export async function startProxy(): Promise<number> {
     // Parked turns each hold a live claude CLI child; nothing resumes them
     // once the listener is gone.
     runtime.stopOwner = clearAllBridges;
+    runtime.teardownOwnerSession = teardownLocalSession;
     if (!runtime.port) {
       throw new Error("Failed to bind Claude proxy to a port");
     }
@@ -435,6 +467,7 @@ export async function stopProxy(): Promise<void> {
   const runtime = sharedProxyRuntime();
   const stopOwner = runtime.stopOwner ?? clearAllBridges;
   runtime.stopOwner = null;
+  runtime.teardownOwnerSession = null;
   stopOwner();
   if (runtime.server) {
     runtime.server.stop(true);
