@@ -211,7 +211,11 @@ export async function startClaudeQuery(
     (await resolveClaudeCodeExecutable({ env })) ||
     undefined;
 
+  // Aborting runs the SDK transport's own SIGTERM → SIGKILL child cleanup,
+  // which still works when the stream is wedged and return() never settles.
+  const abortController = new AbortController();
   const options: Record<string, unknown> = {
+    abortController,
     cwd,
     env,
     includePartialMessages: params.includePartialMessages !== false,
@@ -403,6 +407,7 @@ export async function startClaudeQuery(
         // ignore
       }
     }
+    abortController.abort();
   };
 
   return { stream: result as AsyncIterable<unknown>, interrupt, close, getPid };
