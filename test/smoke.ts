@@ -2449,15 +2449,17 @@ async function main() {
 
   await stopProxy();
 
-  // TypeScript build
-  const build = spawnSync("bun", ["run", "build"], {
+  // Type check only. `bun run build` wipes dist/ first, and an OpenCode that
+  // loads this checkout as a plugin hot-reloads it, fails on the missing
+  // dist/index.js and interrupts the session that ran the tests.
+  const build = spawnSync("bun", ["x", "tsc", "-p", "tsconfig.json", "--noEmit"], {
     cwd: new URL("..", import.meta.url).pathname,
     encoding: "utf8",
   });
   if (build.status !== 0) {
     console.error(build.stdout);
     console.error(build.stderr);
-    throw new Error("build failed");
+    throw new Error("type check failed");
   }
 
   console.log("ok — opencode-claude smoke tests passed");
