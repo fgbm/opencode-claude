@@ -1,5 +1,57 @@
 # Changelog
 
+## 1.2.3 - 2026-09-27
+
+- **Fix: Claude didn't know about MCP and OpenChamber tools**: OpenCode 2.x
+  reaches MCP servers, OpenChamber's tools and the browser through its
+  `execute` tool, and lists them in a Code Mode section of its own system
+  prompt, which the plugin doesn't forward. Claude only saw a bare `execute`
+  and had to guess. That one section, the tool catalog, now reaches Claude;
+  the rest of OpenCode's prompt still doesn't.
+
+## 1.2.2 - 2026-09-27
+
+- **Fix: "Retrying" after limits were reset**: the plugin kept blocking turns
+  until the old reset time, even after Claude reported the limit open again
+  or the user reset their limits early. An "allowed" update from Claude now
+  lifts the block, and every new message is checked with Claude once;
+  OpenCode's automatic retries of the same request still wait.
+- **Stopping a session stops Claude**: aborting while a tool runs now closes
+  the turn and its `claude` process right away instead of after an hour.
+- **Model switches after a refusal are visible**: when Claude Code retries a
+  refused request on another model (Fable → Opus), a note appears in the
+  reasoning and the OpenCode session moves to the model that is answering.
+- **Earlier compaction on 1M models**: they declare a 900k input limit, so
+  OpenCode compacts around 90% instead of at the very edge.
+- **Clear error when tools can't load**: a turn whose OpenCode tools failed
+  to load now fails with a message instead of running without tools.
+
+Thanks to @samiralibabic, @MTEKode, @mradwankhalil and @android6, whose PRs
+and issues pointed at these.
+
+## 1.2.1 - 2026-09-27
+
+- **Fix: parallel tool calls mostly ran one by one**: Claude Code starts a
+  message's tool calls only after the message ends, microseconds apart, and
+  the plugin handed off the first call before the rest had started. About two
+  of three read/grep/subagent groups were split into separate steps. The
+  plugin now waits for the whole group Claude announced (at most 300 ms), so
+  they reach OpenCode together.
+
+## 1.2.0 - 2026-09-27
+
+- **Fix: one idle project cut off turns in the others**: OpenCode closes idle
+  projects every few minutes, and each close stopped the proxy that every
+  project shares. Running turns elsewhere were cut mid-work and rebuilt, and
+  now and then failed outright. The proxy now stays up while any project
+  uses it.
+- **Thinking shows up while Claude thinks**: Claude Code streamed empty
+  thinking blocks, so the chat stayed silent for as long as Claude reasoned
+  and then the answer landed at once. Thinking summaries now stream into the
+  reasoning block, same as in t3code.
+- The model list is refreshed from the CLI at most every ten minutes instead
+  of on every plugin start.
+
 ## 1.1.1 - 2026-09-26
 
 - **Fix: phantom "attachments" while tools run**: OpenCode 2.x sends images a

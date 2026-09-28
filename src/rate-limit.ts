@@ -122,6 +122,13 @@ export function recordRateLimitInfo(info: unknown): ClaudeRateLimitState | null 
         : prev.resetsAt,
     updatedAt: Date.now(),
   };
+  // Claude reports the window open again (reset time passed, or the user
+  // reset their limits early): lift the gate instead of waiting for the old
+  // reset time.
+  if (next.status === "allowed" || next.status === "allowed_warning") {
+    next.limited = false;
+    delete next.limitedUntil;
+  }
   writeState(next);
   return next;
 }

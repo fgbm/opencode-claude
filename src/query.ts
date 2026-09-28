@@ -261,10 +261,21 @@ export async function startClaudeQuery(
 
   if (params.persistSession === false) options.persistSession = false;
 
+  const settings: Record<string, unknown> = {};
   if (params.isolateMcp === true) {
     options.strictMcpConfig = true;
-    options.settings = { disableClaudeAiConnectors: true };
+    settings.disableClaudeAiConnectors = true;
   }
+
+  // Without these the CLI streams thinking blocks empty: the UI shows nothing
+  // for as long as Claude thinks (tens of seconds), then the answer lands at
+  // once. Summaries stream the reasoning as it happens (same as t3code).
+  if ((options.thinking as { type?: string } | undefined)?.type !== "disabled") {
+    settings.showThinkingSummaries = true;
+    options.extraArgs = { "thinking-display": "summarized" };
+  }
+
+  if (Object.keys(settings).length > 0) options.settings = settings;
 
   if (Number.isInteger(params.maxTurns) && Number(params.maxTurns) > 0) {
     options.maxTurns = params.maxTurns;

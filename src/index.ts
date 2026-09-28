@@ -42,6 +42,7 @@ import { listClaudeSupportedModels } from "./query.js";
 import {
   getClaudeProxyBaseUrl,
   retainProxy,
+  setModelFallbackHandler,
   startProxy,
   teardownSessionBridges,
 } from "./proxy.js";
@@ -108,7 +109,15 @@ export function buildProviderInfo(baseURL: string): ProviderInfo {
   } as unknown as ProviderInfo;
 }
 
+// OpenCode starts a plugin instance per location and recycles idle ones, so
+// setup runs many times a day; the account's model list rarely changes.
+const MODEL_REFRESH_INTERVAL_MS = 10 * 60_000;
+let lastModelRefresh = 0;
+
 async function refreshModelCatalog(reload: () => Promise<void>) {
+  const now = Date.now();
+  if (now - lastModelRefresh < MODEL_REFRESH_INTERVAL_MS) return;
+  lastModelRefresh = now;
   try {
     const rows = await listClaudeSupportedModels();
     if (!rows?.length) return;
@@ -209,7 +218,23 @@ export const ClaudeCodePlugin: Plugin.Plugin = {
     });
 
     const events = new AbortController();
-    void closeTurnsOnSessionIdle(ctx.event, events.signal);
+    void closeTurnsOnSessionStop(ctx.event, events.signal);
+
+    // Claude Code already moved the session to its fallback model; move the
+    // OpenCode session too so the picker and the next turns match it.
+    setModelFallbackHandler((sessionID, modelId, variant) => {
+      void ctx.session
+        .switchModel({
+          sessionID,
+          model: { id: modelId, providerID: PROVIDER_ID, ...(variant ? { variant } : {}) },
+        })
+        .catch((err: unknown) =>
+          log.warn(
+            "[opencode-claude] could not switch the session to the fallback model",
+            err instanceof Error ? err.message : err,
+          ),
+        );
+    });
 
     // The proxy is shared by every location in the process; unloading this
     // one only stops it when no other location still holds it.
@@ -221,18 +246,27 @@ export const ClaudeCodePlugin: Plugin.Plugin = {
   },
 };
 
+/** Events after which a session's parked turn has nobody left to resume it. */
+const SESSION_STOP_EVENTS = new Set([
+  "session.execution.interrupted",
+  "session.execution.failed",
+  // Published when a run ends, including an aborted one.
+  "session.idle",
+]);
+
 /**
- * OpenCode publishes `session.idle` when a run ends, including an aborted
- * one. A turn still parked on a tool at that point was abandoned.
+ * A turn parked on tool calls has no open HTTP request, so an abort never
+ * reaches the proxy; close it as soon as OpenCode stops the session.
  */
-async function closeTurnsOnSessionIdle(
+async function closeTurnsOnSessionStop(
   events: Plugin.Context["event"],
   signal: AbortSignal,
 ): Promise<void> {
   try {
     for await (const event of events.subscribe({ signal })) {
-      if (event.type !== "session.idle") continue;
-      teardownSessionBridges(event.data.sessionID);
+      const e = event as { type?: string; data?: { sessionID?: string } };
+      if (!e.type || !SESSION_STOP_EVENTS.has(e.type) || !e.data?.sessionID) continue;
+      teardownSessionBridges(e.data.sessionID);
     }
   } catch (err) {
     if (signal.aborted) return;

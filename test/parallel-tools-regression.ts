@@ -50,6 +50,9 @@ async function main() {
   let registered: Record<string, RegisteredTool> = {};
   let listed: Array<Record<string, any>> = [];
   let quiet = false;
+  // The real CLI: tool_use blocks stream, message_stop closes the message,
+  // and only then are the calls started, microseconds to milliseconds apart.
+  let afterStop = false;
   proxy.setClaudeQueryStarter(async (params) => {
     registered = (params.mcpServers as any).opencode.instance._registeredTools;
     listed = (await mcpHandlers(params).get("tools/list")!({ method: "tools/list", params: {} }, mcpExtra)).tools;
@@ -58,6 +61,19 @@ async function main() {
         yield { type: "system", subtype: "init", session_id: "par-sess" };
         yield { type: "stream_event", event: { type: "message_start" } };
         yield textDelta("reading two files");
+        if (afterStop) {
+          for (const _ of [0, 1]) {
+            yield { type: "stream_event", event: { type: "content_block_start", content_block: { type: "tool_use", name: "mcp__opencode__read" } } };
+          }
+          yield { type: "stream_event", event: { type: "message_stop" } };
+          const a = registered.read!.handler({ filePath: "a.txt" }, mcpExtra);
+          await sleep(5);
+          const b = registered.read!.handler({ filePath: "b.txt" }, mcpExtra);
+          const done = await Promise.all([a, b]);
+          yield textDelta(`GOT ${done.map((r) => r.content[0]!.text).join("+")}`);
+          yield { type: "result", is_error: false, result: "" };
+          return;
+        }
         // The CLI starts read-only calls while the message still streams:
         // the second one arrives after the first has already parked.
         const first = registered.read!.handler({ filePath: "a.txt" }, mcpExtra);
@@ -115,6 +131,13 @@ async function main() {
     assert.equal(byName.edit._meta?.["anthropic/alwaysLoad"], true);
     assert.equal(registered.read!.annotations?.readOnlyHint, true);
     assert.equal(registered.edit!.annotations?.readOnlyHint, undefined);
+
+    // Calls started after message_stop still travel as one group.
+    afterStop = true;
+    const fast = Date.now();
+    await roundTrip();
+    assert.ok(Date.now() - fast < 2_000, "the announced group completes the hold, no quiet wait");
+    afterStop = false;
 
     quiet = true;
     const started = Date.now();

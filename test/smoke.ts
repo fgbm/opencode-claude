@@ -80,8 +80,23 @@ async function main() {
       },
     } as any);
     assert.equal(seen.strictMcpConfig, true);
-    assert.deepEqual(seen.settings, { disableClaudeAiConnectors: true });
+    assert.equal(seen.settings.disableClaudeAiConnectors, true);
     assert.equal(seen.persistSession, false);
+
+    // Thinking streams as summaries unless thinking is off
+    assert.equal(seen.settings.showThinkingSummaries, true);
+    assert.deepEqual(seen.extraArgs, { "thinking-display": "summarized" });
+    await startClaudeQuery({
+      prompt: "x",
+      cwd: process.cwd(),
+      thinking: { type: "disabled" },
+      queryImpl: () => (input: any) => {
+        seen = input.options;
+        return (async function* () {})();
+      },
+    } as any);
+    assert.equal(seen.extraArgs, undefined);
+    assert.equal(seen.settings?.showThinkingSummaries, undefined);
   }
 
   // Usage: the final message_delta count wins over the opening snapshot
@@ -134,6 +149,17 @@ async function main() {
       "lead",
     );
     assert.deepEqual(withImage.message.content.map((b: any) => b.type), ["text", "image"]);
+  }
+
+  // Code Mode catalog: only that section of OpenCode's system prompt is kept
+  {
+    const { codeModeCatalog } = await import("../src/request-kind.ts");
+    const system = "You are an AI agent running in OpenCode.\n\n# Your Model\nclaude-code\n\n# Code Mode\n\nUse the `execute` tool to call the tools listed below.\n\n## Available tools\ntools.openchamber - Control OpenChamber\n\n# Skills\nfoo";
+    const catalog = codeModeCatalog([{ role: "system", content: system }, { role: "user", content: "hi" }]);
+    assert.match(catalog, /^# Code Mode/);
+    assert.match(catalog, /tools\.openchamber/);
+    assert.doesNotMatch(catalog, /Your Model|running in OpenCode|# Skills/);
+    assert.equal(codeModeCatalog([{ role: "user", content: "hi" }]), "");
   }
 
   // Request kinds: hooked session requests vs stateless generation
@@ -1217,6 +1243,10 @@ async function main() {
     assert.equal(info.settings.baseURL, "http://127.0.0.1:1/v1");
     const listed: any[] = buildClaudeProviderModels(getClaudeModels());
     const sonnetModel = listed.find((m) => m.id === "claude-sonnet-5");
+    // 1M models declare a 900k input limit so OpenCode compacts around 90%
+    const oneM = listed.find((m) => m.limit.context === 1_000_000);
+    assert.equal(oneM?.limit.input, 900_000);
+    assert.equal(sonnetModel.limit.input, undefined);
     assert.deepEqual(
       sonnetModel.variants.map((v: any) => v.id),
       buildEffortVariants(getClaudeModels().find((m) => m.id === "claude-sonnet-5")!),
@@ -1268,6 +1298,81 @@ async function main() {
   );
   assert.equal(requestHeaders["x-opencode-claude-session"], "ses_test");
   assert.equal(PROVIDER_ID, "claude-code");
+  // Refusal fallback: note in reasoning, OpenCode session follows the model
+  {
+    const { catalogIdForFallback, modelFallbackNote, setModelFallbackHandler, setClaudeQueryStarter, startProxy, getClaudeProxyBaseUrl } =
+      await import("../src/proxy.ts");
+    const { setDiscoveredModels, modelsFromSdk } = await import("../src/models.ts");
+    setDiscoveredModels(modelsFromSdk([
+      { value: "claude-fable-5-1", resolvedModel: "claude-fable-5-1", supportedEffortLevels: ["low", "high"] },
+      { value: "claude-opus-5", resolvedModel: "claude-opus-5", supportedEffortLevels: ["low", "high"] },
+    ]));
+    assert.equal(catalogIdForFallback("claude-opus-5", "claude-fable-5-1[1m]"), "claude-opus-5[1m]");
+    assert.match(
+      modelFallbackNote({ original_model: "claude-fable-5-1", fallback_model: "claude-opus-5", api_refusal_category: "bio" }),
+      /Fable 5\.1 declined this request \(bio\); Opus 5 answered/,
+    );
+    const switched: unknown[] = [];
+    setModelFallbackHandler((...args) => switched.push(args));
+    setClaudeQueryStarter(async () => ({
+      stream: (async function* () {
+        yield { type: "system", subtype: "model_refusal_fallback", scope: "session", original_model: "claude-fable-5-1[1m]", fallback_model: "claude-opus-5", api_refusal_category: "bio" };
+        yield { type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "answer from opus" } } };
+        yield { type: "result", is_error: false, usage: {} };
+      })(),
+      interrupt: async () => {},
+      close: () => {},
+      getPid: () => null,
+    }));
+    await startProxy();
+    const res = await fetch(getClaudeProxyBaseUrl() + "/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-opencode-claude-session": "ses_fallback", "x-opencode-claude-kind": "primary" },
+      body: JSON.stringify({ model: "claude-fable-5-1[1m]", stream: true, messages: [{ role: "user", content: "question" }] }),
+    });
+    const body = await res.text();
+    assert.match(body, /declined this request/);
+    assert.match(body, /answer from opus/);
+    assert.deepEqual(switched, [["ses_fallback", "claude-opus-5[1m]", undefined]]);
+    setModelFallbackHandler(null);
+    setClaudeQueryStarter(null);
+  }
+
+  // A stopped OpenCode session closes its parked turn right away
+  {
+    const { putBridge, getBridge } = await import("../src/bridge-pool.ts");
+    const { teardownSessionBridges } = await import("../src/proxy.ts");
+    let closed = false;
+    putBridge({
+      id: "abort-test",
+      conversationKey: "ses_aborted",
+      handle: { stream: (async function* () {})(), close: () => { closed = true; } } as any,
+      pendingTools: new Map(),
+      reportedUsage: new Map(),
+      createdAt: Date.now(),
+    } as any);
+    assert.deepEqual(teardownSessionBridges("ses_other"), []);
+    assert.deepEqual(teardownSessionBridges("ses_aborted"), ["ses_aborted"]);
+    assert.equal(closed, true);
+    assert.equal(getBridge("abort-test"), undefined);
+  }
+
+  // Evicting one OpenCode location must not stop the proxy another still uses
+  {
+    const { retainProxy } = await import("../src/proxy.ts");
+    await stopProxy();
+    const first = await startProxy();
+    const releaseFirst = retainProxy();
+    const second = await startProxy();
+    const releaseSecond = retainProxy();
+    assert.equal(first, second, "locations share one proxy");
+    await releaseFirst();
+    await releaseFirst();
+    assert.equal(getProxyPort(), first, "still listening for the other location");
+    await releaseSecond();
+    assert.equal(getProxyPort(), null, "last location stops it");
+  }
+
   // Proxy health (without Agent SDK turn)
   await stopProxy();
   const port = await startProxy();
@@ -1893,6 +1998,31 @@ async function main() {
       assert.equal(rateLimitGate().blocked, false);
       delete process.env.OPENCODE_CLAUDE_RATE_LIMIT_FAST_FAIL;
       assert.equal(rateLimitGate().blocked, true);
+
+      // A stale limit (reset early): a new message still reaches Claude once,
+      // and an "allowed" event from Claude lifts the gate.
+      setClaudeQueryStarter(async () => ({
+        stream: (async function* () {
+          yield { type: "rate_limit_event", rate_limit_info: { status: "allowed" } };
+          yield { type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "back to work" } } };
+          yield { type: "result", is_error: false, usage: {} };
+        })(),
+        interrupt: async () => {},
+        close: () => {},
+        getPid: () => null,
+      }));
+      const freshMessage = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-opencode-claude-session": "smoke-mock-mid-run-limit" },
+        body: JSON.stringify({ model: "sonnet", stream: false, messages: [
+          { role: "user", content: "keep working" },
+          { role: "assistant", content: "limited" },
+          { role: "user", content: "limits were reset, go on" },
+        ] }),
+      });
+      assert.equal(freshMessage.status, 200, "a new message is not gated");
+      assert.match(await freshMessage.text(), /back to work/);
+      assert.equal(rateLimitGate().blocked, false, "allowed event lifts the gate");
 
       // Expired hard block self-heals on read
       const { writeFileSync } = await import("node:fs");

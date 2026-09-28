@@ -80,3 +80,19 @@ export function requestKeyNamespace(kind: MetaRequestKind): string {
   if (kind === "generate") return "generate:";
   return "";
 }
+
+/**
+ * OpenCode 2.x reaches some tools (MCP servers, OpenChamber's own tools) only
+ * through its `execute` tool, and lists them in a "# Code Mode" section of its
+ * system prompt. That prompt is not forwarded, so this one section is: it is
+ * the tool catalog, not host identity. Later catalog changes arrive as
+ * ordinary messages and pass through already.
+ */
+export function codeModeCatalog(messages: MessageLike[]): string {
+  const system = metaSystemPrompt(messages);
+  const start = system.indexOf("# Code Mode");
+  if (start < 0) return "";
+  const rest = system.slice(start);
+  const next = rest.slice(1).search(/\n# /);
+  return (next < 0 ? rest : rest.slice(0, next + 1)).trim();
+}

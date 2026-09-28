@@ -30,7 +30,7 @@ import {
   decodeClaudeModelSelection,
   EFFORT_HEADER,
 } from "./model-selection.js";
-import { getClaudeModels, resolveClaudeModelId } from "./models.js";
+import { getClaudeModels, modelNameFromId, resolveClaudeModelId } from "./models.js";
 import {
   openCodeSystemContext,
   systemContextForwardingEnabled,
@@ -90,6 +90,7 @@ import {
 import {
   detectMetaRequestKind,
   metaSystemPrompt,
+  codeModeCatalog,
   type MetaRequestKind,
   requestKeyNamespace,
 } from "./request-kind.js";
@@ -113,6 +114,27 @@ const SHARED_PROXY_HEALTH_TIMEOUT_MS = 750;
  * PARALLEL_SAFE_TOOLS). This much silence from the CLI ends the wait.
  */
 const PARK_QUIET_MS = 3_000;
+
+/**
+ * The CLI starts a message's tool calls only after message_stop, a few
+ * microseconds apart. Once the message is closed, wait this long at most
+ * for the rest of the group it announced before handing off what arrived.
+ */
+const PARK_SETTLE_MS = 300;
+
+/**
+ * How many calls the CLI starts together for a message whose tool_use
+ * blocks are `names`: the leading run of readOnlyHint tools, or the first
+ * call alone when it is not one of them.
+ */
+export function expectedParallelGroup(names: string[]): number {
+  let run = 0;
+  for (const name of names) {
+    if (!PARALLEL_SAFE_TOOLS.has(name)) break;
+    run += 1;
+  }
+  return Math.max(1, run);
+}
 
 const STRUCTURED_OUTPUT_TOOL = "StructuredOutput";
 
@@ -313,7 +335,7 @@ function teardownLocalSession(sessionID: string): string[] {
     const key = requestKeyNamespace(kind) + sessionID;
     const bridge = findBridgeByConversation(key);
     if (!bridge) continue;
-    log.info("[opencode-claude] session went idle with a live bridge, closing it", {
+    log.info("[opencode-claude] session stopped with a live bridge, closing it", {
       conversationKey: key,
       pending: bridge.pendingTools.size,
     });
@@ -677,6 +699,49 @@ function logTurnUsage(
 }
 
 /**
+ * Claude Code retried a refused request on another model and, for scope
+ * "session", keeps using it. The plugin entry moves the OpenCode session to
+ * that model so what OpenCode shows matches what Claude Code runs.
+ */
+type ModelFallbackHandler = (sessionId: string, modelId: string, variant?: string) => void;
+let modelFallbackHandler: ModelFallbackHandler | null = null;
+
+export function setModelFallbackHandler(handler: ModelFallbackHandler | null): void {
+  modelFallbackHandler = handler;
+}
+
+/** Catalog id for the CLI's fallback model, keeping the 1M variant if picked. */
+export function catalogIdForFallback(fallback: string, original: string): string {
+  const ids = new Set(getClaudeModels().map((m) => m.id));
+  const base = fallback.replace(/\[1m\]$/i, "");
+  const wants1M = /\[1m\]$/i.test(original);
+  for (const candidate of wants1M ? [`${base}[1m]`, base] : [base, `${base}[1m]`]) {
+    if (ids.has(candidate)) return candidate;
+  }
+  return fallback;
+}
+
+export function modelFallbackNote(event: {
+  original_model?: string;
+  fallback_model?: string;
+  api_refusal_category?: string | null;
+}): string {
+  const from = modelNameFromId(event.original_model) ?? event.original_model ?? "The selected model";
+  const to = modelNameFromId(event.fallback_model) ?? event.fallback_model ?? "another model";
+  const why = event.api_refusal_category ? ` (${event.api_refusal_category})` : "";
+  return `\n[model] ${from} declined this request${why}; ${to} answered, and Claude Code keeps using it in this session.\n`;
+}
+
+const gateChecked = new Set<string>();
+
+function rememberGateCheck(key: string): void {
+  gateChecked.add(key);
+  if (gateChecked.size > 500) {
+    gateChecked.delete(gateChecked.values().next().value as string);
+  }
+}
+
+/**
  * OpenCode v2 names the request kind through the plugin's model.request hook.
  * Stateless generation (/api/experimental/generate) bypasses session hooks,
  * so a request with neither the kind nor the session header is one of those.
@@ -867,15 +932,28 @@ async function handleChatCompletions(
   // the event it carries is not lost.
   let pendingNext: Promise<IteratorResult<unknown>> | null = null;
 
+  // OpenCode tool names of the tool_use blocks in the current message.
+  let messageToolNames: string[] = [];
+
   const trackMessageState = (event: unknown) => {
     if (!event || typeof event !== "object") return;
     const e = event as Record<string, unknown>;
     // Only the stream's message_stop closes the message: the CLI emits an
     // `assistant` event after every content block, not once per message.
     if (e.type === "stream_event" && e.event && typeof e.event === "object") {
-      const type = (e.event as { type?: unknown }).type;
-      if (type === "message_start") messageOpen = true;
-      if (type === "message_stop") messageOpen = false;
+      const ev = e.event as { type?: unknown; content_block?: { type?: unknown; name?: unknown } };
+      if (ev.type === "message_start") {
+        messageOpen = true;
+        messageToolNames = [];
+      }
+      if (ev.type === "message_stop") messageOpen = false;
+      if (
+        ev.type === "content_block_start" &&
+        ev.content_block?.type === "tool_use" &&
+        typeof ev.content_block.name === "string"
+      ) {
+        messageToolNames.push(ev.content_block.name.replace(/^mcp__opencode__/, ""));
+      }
     }
   };
 
@@ -950,8 +1028,15 @@ async function handleChatCompletions(
   // Retry-After instead of spawning a doomed Agent SDK turn (which would
   // surface as a fake "completed" assistant message and burn time).
   // Placed after input validation so malformed requests still get 400.
+  // The stored limit can be stale: the user may have reset their limits
+  // early. Each new user message is checked against Claude once (a limited
+  // account is refused before any generation); OpenCode's automatic retries
+  // of the same request stay blocked until the reset.
+  const gateKey = `${conversationKey}:${messages.length}`;
   const gate = rateLimitGate();
-  if (gate.blocked) {
+  const alreadyTried = gateChecked.has(gateKey);
+  rememberGateCheck(gateKey);
+  if (gate.blocked && alreadyTried) {
     log.warn("[opencode-claude] rate-limit gate blocked a turn", {
       conversationKey,
       retryAfterSeconds: gate.retryAfterSeconds,
@@ -1012,11 +1097,23 @@ async function handleChatCompletions(
       ? await buildOpenCodeMcpServer(openCodeTools, pendingTools, notifyPark)
       : undefined;
 
-  // buildOpenCodeMcpServer logs and returns undefined on failure. Bridging
-  // anyway would disable the built-in tools with no mcp__opencode__* ones
-  // registered, so fall back to Claude Code's own tools instead.
-  const bridgeOpenCodeTools =
-    !isMetaRequest && openCodeTools.length > 0 && mcpServers !== undefined;
+  const bridgeOpenCodeTools = !isMetaRequest && openCodeTools.length > 0;
+  // The tool bridge failed to build: Claude would be told to use OpenCode
+  // tools that do not exist. Claude Code's own tools are never a fallback,
+  // so say what happened instead of running a turn without tools.
+  if (bridgeOpenCodeTools && !mcpServers) {
+    return Response.json(
+      {
+        error: {
+          message:
+            "Claude Code could not load OpenCode's tools for this turn, so it was not started. Check the opencode-claude debug log, then retry.",
+          type: "server_error",
+          code: "claude_tool_bridge_failed",
+        },
+      },
+      { status: 503 },
+    );
+  }
   const openCodeToolNames = openCodeTools
     .map((t) => t.function?.name)
     .filter((n): n is string => typeof n === "string" && n.length > 0);
@@ -1083,6 +1180,14 @@ async function handleChatCompletions(
       : promptAsStream(mainPrompt);
 
   const hasTodoWrite = openCodeToolNames.includes("todowrite");
+  const systemContext =
+    !isMetaRequest && systemContextForwardingEnabled() ? openCodeSystemContext(messages) : "";
+  // The forwarded context already carries the Code Mode catalog; without
+  // forwarding, pass just that section so Claude still knows what execute reaches.
+  const bridgesExecute = bridgeOpenCodeTools && openCodeToolNames.includes("execute");
+  const codeMode =
+    bridgesExecute && !systemContext.includes("# Code Mode") ? codeModeCatalog(messages) : "";
+  const hasCodeMode = bridgesExecute && (Boolean(codeMode) || systemContext.includes("# Code Mode"));
   const systemAppend = [
     buildRuntimeInstructions({
       modelName: getClaudeModels().find((m) => m.id === selection.modelId)?.name,
@@ -1101,9 +1206,9 @@ async function handleChatCompletions(
           ].join(" "),
         ]
       : []),
-    ...(!isMetaRequest && systemContextForwardingEnabled()
-      ? [openCodeSystemContext(messages)]
-      : []),
+    systemContext,
+    codeMode,
+    ...(hasCodeMode ? ["The `execute` tool in the Code Mode section is mcp__opencode__execute."] : []),
   ]
     .filter(Boolean)
     .join("\n\n");
@@ -1216,6 +1321,8 @@ async function handleChatCompletions(
     // Set once the calls are handed to OpenCode. A stream that ends or fails
     // while a park is still held is a dead turn, not a parked one.
     let handedOff = false;
+    // The settle window ran out: hand off whatever the group has.
+    let settled = false;
     try {
       while (true) {
         // Parked and the message is closed: hand every collected call to
@@ -1223,7 +1330,14 @@ async function handleChatCompletions(
         // may run side by side (readOnlyHint ones); here they are only
         // forwarded, and OpenCode runs one response's calls concurrently.
         const holding = parked && pendingTools.size > 0;
-        if (holding && !messageOpen) {
+        // Closed message: hand off once the CLI has started the whole group
+        // it runs together, or when the settle window below runs out.
+        if (
+          holding &&
+          !messageOpen &&
+          (settled || pendingTools.size >= expectedParallelGroup(messageToolNames))
+        ) {
+          settled = false;
           armParkReap();
           handedOff = true;
           yield { type: "__park__", tools: [...pendingTools.values()] };
@@ -1232,20 +1346,21 @@ async function handleChatCompletions(
         const parkControl = {
           cancel: null as (() => void) | null,
         };
+        // Every registration wakes the loop: the first parks the turn, later
+        // ones may complete the group being held.
         const parkPromise = new Promise<void>((resolve) => {
-          // Already parked: the message close decides, not another park.
-          if (holding) return;
           const entry = () => resolve();
           parkWaiters.push(entry);
           parkControl.cancel = () => {
             parkWaiters = parkWaiters.filter((w) => w !== entry);
           };
         });
-        // Holding and the CLI went quiet: the message will not close by itself.
+        // Holding: an open message that goes quiet will not close by itself;
+        // a closed one only needs a moment for its sibling calls to start.
         let quietTimer: ReturnType<typeof setTimeout> | null = null;
         const quietPromise = new Promise<void>((resolve) => {
           if (!holding) return;
-          quietTimer = setTimeout(resolve, PARK_QUIET_MS);
+          quietTimer = setTimeout(resolve, messageOpen ? PARK_QUIET_MS : PARK_SETTLE_MS);
           quietTimer.unref?.();
         });
 
@@ -1304,6 +1419,7 @@ async function handleChatCompletions(
         }
         if (raced.kind === "quiet") {
           pendingNext = nextPromise;
+          if (!messageOpen) settled = true;
           messageOpen = false;
           continue;
         }
@@ -1318,6 +1434,29 @@ async function handleChatCompletions(
           });
         }
         logTurnUsage(event, { conversationKey, metaKind, model: queryModel });
+        const fallback = event as {
+          type?: string;
+          subtype?: string;
+          scope?: string;
+          original_model?: string;
+          fallback_model?: string;
+        };
+        if (
+          fallback.type === "system" &&
+          fallback.subtype === "model_refusal_fallback" &&
+          fallback.scope !== "local" &&
+          fallback.fallback_model &&
+          sessionHeader &&
+          !isMetaRequest
+        ) {
+          const target = catalogIdForFallback(fallback.fallback_model, fallback.original_model ?? model);
+          log.info("[opencode-claude] Claude Code switched models after a refusal", {
+            conversationKey,
+            from: fallback.original_model,
+            to: target,
+          });
+          modelFallbackHandler?.(sessionHeader, target, selection.effort);
+        }
         yield event;
       }
     } finally {
@@ -2383,6 +2522,10 @@ function mapSdkEvent(event: unknown, state?: MapState): MappedEvent {
     const state = recordRateLimitInfo(rawInfo);
     const note = maybeRateLimitNote(state, rawInfo);
     return note ? { kind: "reasoning", text: note } : { kind: "ignore" };
+  }
+
+  if (e.type === "system" && e.subtype === "model_refusal_fallback") {
+    return { kind: "reasoning", text: modelFallbackNote(e as Parameters<typeof modelFallbackNote>[0]) };
   }
 
   // Auto-compact boundary — surface as a short reasoning note for the UI.
