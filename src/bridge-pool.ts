@@ -17,6 +17,8 @@ export type ParkedToolCall = {
 export type ParkedBridge = {
   id: string;
   conversationKey: string;
+  /** Request kind of the turn (title, summary, generate), null for chat. */
+  metaKind?: string | null;
   handle: StoppableClaudeQueryHandle;
   pendingTools: Map<string, ParkedToolCall>;
   /**

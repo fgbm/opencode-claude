@@ -23,9 +23,13 @@ import {
 import { buildClaudeCodeChildEnv } from "./auth-env.js";
 import {
   classifyClaudeFailure,
+  failureCodeFor,
   failureHintFor,
   failureStatusFor,
   failureTypeFor,
+  metaFailureText,
+  resultErrorText,
+  thrownErrorText,
 } from "./failure.js";
 import {
   decodeClaudeModelSelection,
@@ -1188,6 +1192,7 @@ async function startNewTurn(input: {
   const bridge: ParkedBridge = {
     id: bridgeId,
     conversationKey,
+    metaKind,
     handle,
     pendingTools,
     reportedUsage: new Map(),
@@ -1399,7 +1404,7 @@ async function startNewTurn(input: {
   if (stream) {
     const probe = await probeTurnEvents(consumeStream());
     if (probe.status === "failed") {
-      return failureResponse(probe.errorText, conversationKey);
+      return failureResponse(probe.errorText, conversationKey, metaKind);
     }
     return streamOpenAIResponse(probe.replay, body.model || model, bridge);
   }
@@ -1729,22 +1734,27 @@ async function collectTurnResponse(
       }
     }
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    recordRateLimitErrorText(message);
-    forgetDeadSession(bridge.conversationKey, message);
-    noteError(message);
+    // Null: only CLI diagnostics after an error result already noted.
+    const message = thrownErrorText(err) ?? (errorText ? null : "Claude turn failed");
+    if (message) {
+      recordRateLimitErrorText(message);
+      forgetDeadSession(bridge.conversationKey, message);
+      noteError(message);
+    }
   }
 
   const usage = resolveTurnUsage(usageTracker.total(), resultUsage);
 
   // Buffered responses have not committed HTTP headers yet. Even if an agent
   // produced partial work first, preserve the real 429 so OpenCode starts its
-  // retry countdown instead of treating the run as a successful answer.
+  // retry countdown instead of treating the run as a successful answer, and
+  // the real context overflow so OpenCode compacts instead.
+  const failureKind = errorText ? classifyClaudeFailure(errorText) : null;
   if (
     errorText &&
-    (!sawContent || classifyClaudeFailure(errorText) === "rate_limit")
+    (!sawContent || failureKind === "rate_limit" || failureKind === "context_overflow")
   ) {
-    return failureResponse(errorText, bridge.conversationKey);
+    return failureResponse(errorText, bridge.conversationKey, bridge.metaKind);
   }
 
   return Response.json({
@@ -1830,9 +1840,7 @@ function rawErrorText(event: unknown): string {
   const e = (event ?? {}) as Record<string, unknown>;
   const assistantText = assistantErrorText(e);
   if (assistantText) return assistantText;
-  if (typeof e.result === "string" && e.result) return e.result;
-  if (typeof e.error === "string" && e.error) return e.error;
-  return "Claude turn failed";
+  return resultErrorText(e);
 }
 
 async function* chainBuffered(
@@ -1882,7 +1890,7 @@ async function probeTurnEvents(
       }
     }
   } catch (err) {
-    return fail(err instanceof Error ? err.message : String(err));
+    return fail(thrownErrorText(err) ?? "Claude turn failed");
   }
   return fail("Claude Code ended the turn without any output");
 }
@@ -1896,9 +1904,11 @@ const PASS_THROUGH_4XX = new Set([400, 404, 413, 422]);
  * follow-up requests get a cheap 429 without spawning a doomed CLI turn.
  */
 function failureResponse(
-  errorText: string,
+  rawErrorText: string,
   conversationKey: string,
+  metaKind?: string | null,
 ): Response {
+  const errorText = metaFailureText(rawErrorText, metaKind);
   recordRateLimitErrorText(errorText);
   forgetDeadSession(conversationKey, errorText);
   const kind = classifyClaudeFailure(errorText);
@@ -1962,7 +1972,7 @@ function failureResponse(
       error: {
         message: hint ? `${errorText} ${hint}` : errorText,
         type: refused ? "invalid_request_error" : failureTypeFor(kind),
-        code: kind === "auth" ? "claude_auth" : "claude_turn_failed",
+        code: failureCodeFor(kind),
       },
     },
     { status: refused ?? failureStatusFor(kind) },
@@ -2156,17 +2166,21 @@ function streamOpenAIResponse(
           }
         }
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
         // A limit/result failure typically arrives here right after the SDK
         // emitted the same text as a result event — dedupe via sendError.
-        recordRateLimitErrorText(message);
-        forgetDeadSession(bridge.conversationKey, message);
-        log.warn("[opencode-claude] stream iterator failed", {
-          conversationKey: bridge.conversationKey,
-          kind: classifyClaudeFailure(message),
-          message: message.slice(0, 300),
-        });
-        sendError(message);
+        // Only diagnostics left: the result event said it all already.
+        const message =
+          thrownErrorText(err) ?? (lastErrorNorm ? null : "Claude turn failed");
+        if (message) {
+          recordRateLimitErrorText(message);
+          forgetDeadSession(bridge.conversationKey, message);
+          log.warn("[opencode-claude] stream iterator failed", {
+            conversationKey: bridge.conversationKey,
+            kind: classifyClaudeFailure(message),
+            message: message.slice(0, 300),
+          });
+          sendError(message);
+        }
         finishReason = "stop";
       }
 
@@ -2392,12 +2406,7 @@ function mapSdkEvent(event: unknown, state?: MapState): MappedEvent {
   if (e.type === "result") {
     const usage = usageFromSdkResult(event);
     if (e.is_error) {
-      const text =
-        typeof e.result === "string"
-          ? e.result
-          : typeof e.error === "string"
-            ? e.error
-            : "Claude turn failed";
+      const text = resultErrorText(e);
       // Hard subscription limit? Record it so the gate + counter activate.
       const limited = recordRateLimitErrorText(text);
       let note = text;
