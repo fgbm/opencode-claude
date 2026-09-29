@@ -42,6 +42,8 @@ import {
   conversationKeyFromMessages,
   findClaudeSessionFile,
   getForeignSessionId,
+  getSessionLeafUuid,
+  sessionFileHasEntry,
   setForeignSessionId,
 } from "./session-store.js";
 import { log } from "./log.js";
@@ -739,6 +741,17 @@ async function handleChatCompletions(
     }
   }
 
+  // A new turn while an earlier one of this chat still runs (OpenCode
+  // restarted, retried, or moved on): close the old one first. Two claude
+  // processes writing the same session file fork its history.
+  if (metaKind === null && existing && existing.conversationKey === conversationKey) {
+    log.warn("[opencode-claude] closing an earlier turn still running for this chat", {
+      conversationKey,
+    });
+    deleteBridge(existing.id);
+    existing = undefined;
+  }
+
   log.info("[opencode-claude] chat completions", {
     conversationKey,
     sessionHeader,
@@ -902,7 +915,8 @@ async function handleChatCompletions(
   }
 
   let resume = getForeignSessionId(conversationKey);
-  if (resume && !findClaudeSessionFile(resume)) {
+  const sessionFile = resume ? findClaudeSessionFile(resume) : null;
+  if (resume && !sessionFile) {
     // The claude CLI resumes by looking the session up on disk. A missing
     // transcript (cleanup, different machine, pruned projects dir) would
     // silently start a context-free session — drop the stale binding and
@@ -914,6 +928,14 @@ async function handleChatCompletions(
     clearForeignSessionId(conversationKey);
     resume = undefined;
   }
+
+  // Pin the resume to the last entry this plugin saw, so a branch written by
+  // another claude process on the same session can't replace the history.
+  const leafUuid = resume ? getSessionLeafUuid(conversationKey) : undefined;
+  const resumeSessionAt =
+    leafUuid && sessionFile && sessionFileHasEntry(sessionFile, leafUuid)
+      ? leafUuid
+      : undefined;
 
   // No resumable Claude session (first claude-code turn of this chat, model
   // switch mid-conversation, lost store): serialize the prior OpenCode
@@ -1024,6 +1046,7 @@ async function handleChatCompletions(
     // of the model the user picked for the chat.
     model: queryModel,
     resume: isMetaRequest ? undefined : resume,
+    resumeSessionAt: isMetaRequest ? undefined : resumeSessionAt,
     effort: isMetaRequest ? undefined : selection.effort,
     env,
     mcpServers: isMetaRequest ? undefined : mcpServers,
@@ -1235,6 +1258,7 @@ async function handleChatCompletions(
           setForeignSessionId(conversationKey, sessionId, {
             modelId: model,
             cwd,
+            leafUuid: mainChainUuid(event),
           });
         }
         logTurnUsage(event, { conversationKey, metaKind, model: queryModel });
@@ -1293,6 +1317,16 @@ async function handleChatCompletions(
   return collectTurnResponse(consumeStream(), body.model || model, bridge);
 }
 
+
+/** Transcript uuid of a main-chain (not subagent) assistant or user event. */
+function mainChainUuid(event: unknown): string | undefined {
+  if (!event || typeof event !== "object") return undefined;
+  const e = event as Record<string, unknown>;
+  if (e.type !== "assistant" && e.type !== "user") return undefined;
+  if (e.parent_tool_use_id) return undefined;
+  if (e.isReplay === true) return undefined;
+  return typeof e.uuid === "string" && e.uuid ? e.uuid : undefined;
+}
 
 function extractSessionId(event: unknown): string | null {
   if (!event || typeof event !== "object") return null;

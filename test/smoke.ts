@@ -1752,6 +1752,7 @@ async function main() {
       clearForeignSessionId,
       findClaudeSessionFile,
       getForeignSessionId,
+      getSessionLeafUuid,
       setForeignSessionId,
     } = await import("../src/session-store.ts");
     const { mkdirSync, rmSync, writeFileSync, mkdtempSync } = await import(
@@ -1859,6 +1860,61 @@ async function main() {
         String(seen2.params!.prompt ?? ""),
         /<conversation_history>/,
       );
+      assert.equal(seen2.params!.resumeSessionAt, undefined);
+
+      // 2b. The turn's main-chain entries become the resume point. A later
+      //     resume pins to it, so a branch another claude process appended
+      //     to the same file (an orphaned turn closed by the TTL reaper)
+      //     can't replace the history. Subagent entries don't move it.
+      setClaudeQueryStarter(async (params) => {
+        seen2.params = params as unknown as Record<string, unknown>;
+        return {
+          stream: (async function* () {
+            yield { type: "system", subtype: "init", session_id: "mock-sess-live" };
+            yield {
+              type: "assistant",
+              uuid: "leaf-main",
+              session_id: "mock-sess-live",
+              parent_tool_use_id: null,
+              message: { content: [] },
+            };
+            yield {
+              type: "assistant",
+              uuid: "leaf-subagent",
+              session_id: "mock-sess-live",
+              parent_tool_use_id: "toolu_sub",
+              message: { content: [] },
+            };
+            yield {
+              type: "stream_event",
+              event: {
+                type: "content_block_delta",
+                delta: { type: "text_delta", text: "MOCK_OK" },
+              },
+            };
+            yield { type: "result", is_error: false, usage: {} };
+          })(),
+          interrupt: async () => {},
+          close: () => {},
+          getPid: () => null,
+        };
+      });
+      await (await postChat("smoke-history-resume", historyMessages)).text();
+      assert.equal(getSessionLeafUuid("smoke-history-resume"), "leaf-main");
+      writeFileSync(
+        joinPath(fakeProjectsDir, "mock-sess-live.jsonl"),
+        '{"uuid":"leaf-main"}\n{"parentUuid":"old-point","uuid":"stale-branch"}\n',
+      );
+      mockTurn(seen2, "mock-sess-live");
+      await (await postChat("smoke-history-resume", historyMessages)).text();
+      assert.equal(seen2.params!.resume, "mock-sess-live");
+      assert.equal(seen2.params!.resumeSessionAt, "leaf-main");
+      // A leaf the file no longer holds falls back to a plain resume.
+      writeFileSync(joinPath(fakeProjectsDir, "mock-sess-live.jsonl"), "{}\n");
+      mockTurn(seen2, "mock-sess-live");
+      await (await postChat("smoke-history-resume", historyMessages)).text();
+      assert.equal(seen2.params!.resume, "mock-sess-live");
+      assert.equal(seen2.params!.resumeSessionAt, undefined);
       rmSync(fakeProjectsDir, { recursive: true, force: true });
 
       // 3. Stored binding with a MISSING transcript file → binding dropped,

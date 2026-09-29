@@ -11,6 +11,14 @@ export type ClaudeSessionBinding = {
   foreignSessionId: string;
   modelId?: string;
   cwd?: string;
+  /**
+   * Last transcript entry this plugin saw on the conversation's main chain.
+   * Resume pins to it: another claude process writing to the same session
+   * file (a turn orphaned by an OpenCode restart, closed by the TTL reaper
+   * an hour later) appends a branch, and a plain resume follows whichever
+   * branch was written last.
+   */
+  leafUuid?: string;
   updatedAt: number;
 };
 
@@ -47,20 +55,38 @@ export function getForeignSessionId(
   return entry?.foreignSessionId;
 }
 
+export function getSessionLeafUuid(conversationKey: string): string | undefined {
+  return readStore()[conversationKey]?.leafUuid;
+}
+
 export function setForeignSessionId(
   conversationKey: string,
   foreignSessionId: string,
-  meta?: { modelId?: string; cwd?: string },
+  meta?: { modelId?: string; cwd?: string; leafUuid?: string },
 ): void {
   const store = readStore();
+  const previous = store[conversationKey];
+  // A new session id starts a new chain; the old leaf means nothing there.
+  const keptLeaf =
+    previous?.foreignSessionId === foreignSessionId ? previous.leafUuid : undefined;
   store[conversationKey] = {
     conversationKey,
     foreignSessionId,
     modelId: meta?.modelId,
     cwd: meta?.cwd,
+    leafUuid: meta?.leafUuid ?? keptLeaf,
     updatedAt: Date.now(),
   };
   writeStore(store);
+}
+
+/** Whether a Claude Code transcript still holds the entry with this uuid. */
+export function sessionFileHasEntry(file: string, uuid: string): boolean {
+  try {
+    return readFileSync(file, "utf8").includes(`"uuid":"${uuid}"`);
+  } catch {
+    return false;
+  }
 }
 
 export function clearForeignSessionId(conversationKey: string): void {

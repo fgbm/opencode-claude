@@ -131,6 +131,8 @@ export type StartClaudeQueryParams = {
   cwd: string;
   model?: string;
   resume?: string;
+  /** Resume from this transcript entry instead of the file's latest one. */
+  resumeSessionAt?: string;
   permissionMode?: string;
   effort?: ClaudeEffort | string;
   systemPrompt?:
@@ -221,6 +223,8 @@ export async function startClaudeQuery(
 
   const resume = trimmedString(params.resume);
   if (resume) options.resume = resume;
+  const resumeSessionAt = trimmedString(params.resumeSessionAt);
+  if (resume && resumeSessionAt) options.resumeSessionAt = resumeSessionAt;
 
   const permissionMode = trimmedString(params.permissionMode);
   if (ALLOWED_PERMISSION_MODES.has(permissionMode)) {
