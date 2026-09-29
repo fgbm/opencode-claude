@@ -14,6 +14,7 @@ import {
   deleteBridge,
   findBridgeByConversation,
   findBridgeByPendingTool,
+  getBridge,
   putBridge,
   type ParkedBridge,
   type ParkedToolCall,
@@ -787,8 +788,20 @@ async function handleChatCompletions(
   // OpenCode is compacting this chat. The Claude session it would resume
   // still holds the full uncompacted context, so drop the binding: the next
   // turn starts a fresh Claude session from the compacted history instead.
+  // OpenCode compacts between steps, often while the turn is parked on a
+  // tool: that live query holds the same full context, and resuming it would
+  // undo the compaction, so it is closed too.
   if (metaKind === "summary") {
-    clearForeignSessionId(sessionHeader || conversationKeyFromMessages(messages));
+    const chatKey = sessionHeader || conversationKeyFromMessages(messages);
+    const live = findBridgeByConversation(requestKeyNamespace(null) + chatKey);
+    if (live) {
+      log.info("[opencode-claude] compaction with a live turn, closing it", {
+        conversationKey: live.conversationKey,
+        pending: live.pendingTools.size,
+      });
+      deleteBridge(live.id);
+    }
+    clearForeignSessionId(chatKey);
   }
   const selection = selectionFromRequest(req, body);
   const model = resolveClaudeModelId(selection.modelId);
@@ -1427,7 +1440,8 @@ async function handleChatCompletions(
         const event = raced.value.value;
         trackMessageState(event);
         const sessionId = extractSessionId(event);
-        if (sessionId && !isMetaRequest) {
+        // A closed bridge (compaction, teardown) must not rebind its session.
+        if (sessionId && !isMetaRequest && getBridge(bridgeId) === bridge) {
           setForeignSessionId(conversationKey, sessionId, {
             modelId: model,
             cwd,
