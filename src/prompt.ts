@@ -2,6 +2,8 @@
  * Build Claude Agent SDK prompts from OpenAI-compatible chat messages,
  * including text, images, and PDF/document attachments.
  */
+import { createHash } from "node:crypto";
+
 export type AnthropicContentBlock =
   | { type: "text"; text: string }
   | {
@@ -387,6 +389,39 @@ export function extractTextContent(content: unknown): string {
     })
     .filter(Boolean)
     .join("\n");
+}
+
+const SYSTEM_REMINDER_BLOCK = /<system-reminder>[\s\S]*?<\/system-reminder>/g;
+
+/**
+ * One short hash per user message of a conversation, in order: the
+ * conversation's shape as far as revert/edit detection needs it.
+ *
+ * Only user messages count. OpenCode may re-serialize assistant output
+ * (steps split per tool call, reasoning dropped), but a user message is
+ * sent the same way every time. Two kinds are skipped, because they are
+ * not stable across requests: OpenCode's promoted tool media, and
+ * <system-reminder> messages. Plan mode splices its reminder in before the
+ * user's prompt when sending, but stores it after, so its position moves
+ * between requests. Reminder blocks inside other messages are dropped too.
+ * Attachments count by presence only; their encoding may change.
+ */
+export function userHistoryFingerprints(
+  messages: Array<{ role?: string; content?: unknown }>,
+): string[] {
+  const prints: string[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    if (msg?.role !== "user" || isSyntheticToolMediaMessage(msg, messages[i - 1])) continue;
+    const text = extractTextContent(msg.content)
+      .replace(SYSTEM_REMINDER_BLOCK, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    const identity = text || (contentHasAttachments(msg.content) ? "\u0000attachments" : "");
+    if (!identity) continue;
+    prints.push(createHash("sha1").update(identity).digest("hex").slice(0, 16));
+  }
+  return prints;
 }
 
 export function contentHasAttachments(content: unknown): boolean {

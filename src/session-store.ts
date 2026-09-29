@@ -29,8 +29,24 @@ export type ClaudeSessionBinding = {
    * branch was written last.
    */
   leafUuid?: string;
+  /**
+   * Where each OpenCode history this session answered ends in the Claude
+   * transcript, oldest first. A revert or edit in OpenCode shortens the
+   * history; the matching boundary says where to resume from.
+   */
+  turns?: TurnBoundary[];
   updatedAt: number;
 };
+
+/**
+ * One point of a conversation: the OpenCode history held `count` user
+ * messages (see userHistoryFingerprints), the last one hashing to `hash`,
+ * and the Claude session's main chain ended at `leafUuid`.
+ */
+export type TurnBoundary = { count: number; hash: string; leafUuid?: string };
+
+/** Boundaries kept per binding; older ones can no longer be rewound to. */
+const MAX_TURN_BOUNDARIES = 100;
 
 function storePath(): string {
   const xdg = process.env.XDG_DATA_HOME;
@@ -76,17 +92,36 @@ export function getSessionLeafUuid(conversationKey: string): string | undefined 
  */
 const written = new Map<string, Omit<ClaudeSessionBinding, "updatedAt">>();
 
-function sameBinding(
-  a: Omit<ClaudeSessionBinding, "updatedAt"> | undefined,
-  b: Omit<ClaudeSessionBinding, "updatedAt">,
-): boolean {
+/**
+ * Boundary of a turn that started without a binding (first turn, history
+ * transferred after a revert). It joins the binding the turn creates.
+ */
+const pendingTurns = new Map<string, TurnBoundary[]>();
+
+type StoredBinding = Omit<ClaudeSessionBinding, "updatedAt">;
+
+function sameBinding(a: StoredBinding | undefined, b: StoredBinding): boolean {
   return (
     !!a &&
     a.foreignSessionId === b.foreignSessionId &&
     a.leafUuid === b.leafUuid &&
     a.modelId === b.modelId &&
-    a.cwd === b.cwd
+    a.cwd === b.cwd &&
+    JSON.stringify(a.turns ?? []) === JSON.stringify(b.turns ?? [])
   );
+}
+
+function sameBoundary(a: Omit<TurnBoundary, "leafUuid"> | undefined, b: Omit<TurnBoundary, "leafUuid">): boolean {
+  return !!a && a.count === b.count && a.hash === b.hash;
+}
+
+function save(
+  store: Record<string, ClaudeSessionBinding>,
+  binding: StoredBinding,
+): void {
+  written.set(binding.conversationKey, binding);
+  store[binding.conversationKey] = { ...binding, updatedAt: Date.now() };
+  writeStore(store);
 }
 
 export function setForeignSessionId(
@@ -94,25 +129,141 @@ export function setForeignSessionId(
   foreignSessionId: string,
   meta?: { modelId?: string; cwd?: string; leafUuid?: string },
 ): void {
-  const binding = (previous: Omit<ClaudeSessionBinding, "updatedAt"> | undefined) => ({
+  const cached = written.get(conversationKey);
+  if (
+    cached &&
+    !pendingTurns.has(conversationKey) &&
+    cached.foreignSessionId === foreignSessionId &&
+    cached.modelId === meta?.modelId &&
+    cached.cwd === meta?.cwd &&
+    (meta?.leafUuid === undefined || meta.leafUuid === cached.leafUuid)
+  ) {
+    return;
+  }
+  const store = readStore();
+  const previous = store[conversationKey];
+  const sameSession = previous?.foreignSessionId === foreignSessionId;
+  // A new session id starts a new chain; the old leaf means nothing there.
+  const leafUuid = meta?.leafUuid ?? (sameSession ? previous?.leafUuid : undefined);
+  // So do the old boundaries. The new chain holds at most the current turn.
+  let turns: TurnBoundary[] = sameSession
+    ? [...(previous?.turns ?? [])]
+    : previous?.turns?.length
+      ? [previous.turns.at(-1)!]
+      : [];
+  for (const pending of pendingTurns.get(conversationKey) ?? []) {
+    if (!sameBoundary(turns.at(-1), pending)) turns.push({ ...pending });
+  }
+  pendingTurns.delete(conversationKey);
+  if (turns.length > 0 && leafUuid) {
+    turns[turns.length - 1] = { ...turns.at(-1)!, leafUuid };
+  }
+  turns = turns.slice(-MAX_TURN_BOUNDARIES);
+  const next: StoredBinding = {
     conversationKey,
     foreignSessionId,
     modelId: meta?.modelId,
     cwd: meta?.cwd,
-    // A new session id starts a new chain; the old leaf means nothing there.
-    leafUuid:
-      meta?.leafUuid ??
-      (previous?.foreignSessionId === foreignSessionId ? previous.leafUuid : undefined),
-  });
-  const cached = written.get(conversationKey);
-  if (cached && sameBinding(cached, binding(cached))) return;
+    leafUuid,
+    ...(turns.length > 0 ? { turns } : {}),
+  };
+  if (sameBinding(previous, next)) {
+    written.set(conversationKey, next);
+    return;
+  }
+  save(store, next);
+}
+
+export function getSessionTurns(conversationKey: string): TurnBoundary[] {
+  return readStore()[conversationKey]?.turns ?? [];
+}
+
+/**
+ * A turn starts for an OpenCode history of `boundary.count` user messages.
+ * The history the same turn continues (a retry, a rebuilt tool step) keeps
+ * its boundary; a new one is appended and follows the leaf from now on.
+ * Without a binding yet, the boundary waits for the one the turn creates.
+ *
+ * `before` is the history before the turn's prompt. When an existing
+ * binding has no boundaries yet, it is recorded first at the current leaf,
+ * so a retry of this very request can go back to it.
+ */
+export function recordTurnStart(
+  conversationKey: string,
+  boundary: Omit<TurnBoundary, "leafUuid">,
+  before?: Omit<TurnBoundary, "leafUuid">,
+): void {
   const store = readStore();
-  const previous = store[conversationKey];
-  const next = binding(previous);
-  written.set(conversationKey, next);
-  if (sameBinding(previous, next)) return;
-  store[conversationKey] = { ...next, updatedAt: Date.now() };
-  writeStore(store);
+  const binding = store[conversationKey];
+  const turns = [...(binding?.turns ?? [])];
+  if (binding && turns.length === 0 && before && before.count > 0 && !sameBoundary(before, boundary)) {
+    turns.push({ ...before, leafUuid: binding?.leafUuid });
+  }
+  if (!sameBoundary(turns.at(-1), boundary)) {
+    turns.push({ ...boundary, leafUuid: binding?.leafUuid });
+  }
+  if (!binding) {
+    pendingTurns.set(conversationKey, turns);
+    return;
+  }
+  pendingTurns.delete(conversationKey);
+  if (turns.length === (binding.turns ?? []).length) return;
+  const { updatedAt: _updatedAt, ...stored } = binding;
+  save(store, { ...stored, turns: turns.slice(-MAX_TURN_BOUNDARIES) });
+}
+
+/**
+ * OpenCode's history went back to boundary `index` (revert, edit): resume
+ * from its leaf and forget the turns after it.
+ */
+export function rewindSessionTurns(conversationKey: string, index: number): void {
+  const store = readStore();
+  const binding = store[conversationKey];
+  const target = binding?.turns?.[index];
+  if (!binding || !target) return;
+  const { updatedAt: _updatedAt, ...stored } = binding;
+  save(store, {
+    ...stored,
+    leafUuid: target.leafUuid,
+    turns: binding.turns!.slice(0, index + 1),
+  });
+}
+
+export type TurnHistoryMatch =
+  | { kind: "untracked" }
+  | { kind: "latest" }
+  | { kind: "rewind"; index: number; leafUuid?: string }
+  | { kind: "diverged" };
+
+/**
+ * Compare the OpenCode history before a new prompt (as fingerprints) with
+ * the boundaries a binding recorded.
+ * - latest: the history still holds the newest boundary's user messages
+ *   (more may follow: the prompt of a turn that failed before Claude ran,
+ *   a steering message). Resume as usual.
+ * - rewind: the history ends exactly at an earlier boundary, so the turns
+ *   after it were reverted or edited away.
+ * - diverged: nothing lines up; the session holds a history OpenCode no
+ *   longer has.
+ * - untracked: a binding from before boundaries were recorded.
+ */
+export function matchTurnHistory(
+  turns: TurnBoundary[],
+  prints: string[],
+): TurnHistoryMatch {
+  const latest = turns.at(-1);
+  if (!latest) return { kind: "untracked" };
+  const n = prints.length;
+  if (n >= latest.count && prints[latest.count - 1] === latest.hash) {
+    return { kind: "latest" };
+  }
+  for (let i = turns.length - 2; i >= 0; i--) {
+    const turn = turns[i]!;
+    if (turn.count === n && prints[n - 1] === turn.hash) {
+      return { kind: "rewind", index: i, leafUuid: turn.leafUuid };
+    }
+  }
+  return { kind: "diverged" };
 }
 
 /**

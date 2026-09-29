@@ -54,6 +54,10 @@ import {
   findClaudeSessionFile,
   getForeignSessionId,
   getSessionLeafUuid,
+  getSessionTurns,
+  matchTurnHistory,
+  recordTurnStart,
+  rewindSessionTurns,
   sessionFileHasEntry,
   setForeignSessionId,
 } from "./session-store.js";
@@ -80,6 +84,7 @@ import {
   openaiToolResultToMcpContent,
   priorMessagesOf,
   promptAsStream,
+  userHistoryFingerprints,
   withConversationContext,
   withLeadingText,
   buildRuntimeInstructions,
@@ -712,6 +717,14 @@ async function handleChatCompletions(
     }
     if (steeringToolId) {
       for (const m of freshSteering) existing.forwardedSteering.add(m.key);
+      // The history now ends at the steering message: a later revert to
+      // before it rewinds to where the turn was when it arrived.
+      if (!existing.metaKind) {
+        const prints = userHistoryFingerprints(messages);
+        if (prints.length > 0) {
+          recordTurnStart(existing.conversationKey, { count: prints.length, hash: prints.at(-1)! });
+        }
+      }
       log.info("[opencode-claude] forwarding mid-turn user messages", {
         conversationKey: existing.conversationKey,
         blocks: steering.length,
@@ -1012,6 +1025,53 @@ async function startNewTurn(input: {
     });
     clearForeignSessionId(conversationKey);
     resume = undefined;
+  }
+
+  // The user reverted or edited in OpenCode: the history before this prompt
+  // is shorter than, or differs from, what the Claude session holds. Resume
+  // from the boundary where the two still agree, or, when none does, start
+  // over from the history OpenCode has.
+  if (resume && sessionFile && !isMetaRequest) {
+    const match = matchTurnHistory(
+      getSessionTurns(conversationKey),
+      userHistoryFingerprints(priorMessages),
+    );
+    if (
+      match.kind === "rewind" &&
+      match.leafUuid &&
+      sessionFileHasEntry(sessionFile, match.leafUuid)
+    ) {
+      log.info("[opencode-claude] OpenCode history went back; resuming from an earlier turn", {
+        conversationKey,
+        turn: match.index,
+      });
+      rewindSessionTurns(conversationKey, match.index);
+    } else if (match.kind === "rewind" && !match.leafUuid) {
+      // A boundary recorded before this chat's leaf was known: nothing to
+      // pin to, so resume the whole session as before.
+      log.info("[opencode-claude] OpenCode history went back to a turn with no resume point; resuming the session", {
+        conversationKey,
+        turn: match.index,
+      });
+    } else if (match.kind === "rewind" || match.kind === "diverged") {
+      log.warn("[opencode-claude] OpenCode history no longer matches the Claude session; transferring history", {
+        conversationKey,
+        match: match.kind,
+      });
+      clearForeignSessionId(conversationKey);
+      resume = undefined;
+    }
+  }
+  if (!isMetaRequest) {
+    const prints = userHistoryFingerprints(messages);
+    const before = userHistoryFingerprints(priorMessages);
+    if (prints.length > 0) {
+      recordTurnStart(
+        conversationKey,
+        { count: prints.length, hash: prints.at(-1)! },
+        before.length > 0 ? { count: before.length, hash: before.at(-1)! } : undefined,
+      );
+    }
   }
 
   // Pin the resume to the last entry this plugin saw, so a branch written by
