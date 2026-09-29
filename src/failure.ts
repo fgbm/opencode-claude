@@ -9,6 +9,7 @@
  * - context_overflow → 400 context_length_exceeded (OpenCode compacts the chat)
  * - image            → 400 (the same image fails the same way on retry)
  * - refusal          → 400 refusal (Claude declined; a retry is refused too)
+ * - overloaded       → 503 overloaded_error (retryable; OpenCode backs off)
  * - unknown          → 500
  */
 import { isClaudeRateLimitText } from "./rate-limit.js";
@@ -19,6 +20,7 @@ export type ClaudeFailureKind =
   | "context_overflow"
   | "image"
   | "refusal"
+  | "overloaded"
   | "unknown";
 
 const AUTH_FAILURE_PATTERN =
@@ -38,9 +40,13 @@ const IMAGE_FAILURE_PATTERN =
 /** Prefix of the proxy's own text for a refusal no fallback model retried. */
 const REFUSAL_PATTERN = /^Claude declined this request\b/;
 
+/** Prefix of the proxy's own text for a 5xx the CLI reported as success. */
+const OVERLOADED_PATTERN = /^Anthropic (?:is overloaded|returned 5\d\d)\b/;
+
 export function classifyClaudeFailure(text: string): ClaudeFailureKind {
   if (!text) return "unknown";
   if (REFUSAL_PATTERN.test(text)) return "refusal";
+  if (OVERLOADED_PATTERN.test(text)) return "overloaded";
   if (isClaudeRateLimitText(text)) return "rate_limit";
   if (AUTH_FAILURE_PATTERN.test(text)) return "auth";
   if (CONTEXT_OVERFLOW_PATTERN.test(text)) return "context_overflow";
@@ -58,6 +64,8 @@ export function failureStatusFor(kind: ClaudeFailureKind): number {
     case "image":
     case "refusal":
       return 400;
+    case "overloaded":
+      return 503;
     default:
       return 500;
   }
@@ -92,6 +100,9 @@ export function failureCodeFor(kind: ClaudeFailureKind): string {
     // OpenCode reads this code as a content-policy block, not a retry.
     case "refusal":
       return "refusal";
+    // One of the server codes OpenCode retries with its own backoff.
+    case "overloaded":
+      return "overloaded_error";
     default:
       return "claude_turn_failed";
   }
@@ -192,6 +203,21 @@ export function thrownErrorText(error: unknown): string | null {
   if (!prefix.test(raw)) return raw;
   const rest = withoutDiagnostics(raw.replace(prefix, ""));
   return rest ? `Claude Code returned an error result: ${rest}` : null;
+}
+
+/**
+ * The CLI can end a turn as subtype "success" after its own API retries ran
+ * out: no content, is_error false, and the last HTTP status only in
+ * api_error_status (529 overloaded, or another 5xx). Returns the failure
+ * text for such a result, null for a real success.
+ */
+export function overloadedResultText(event: Record<string, unknown>): string | null {
+  if (event.type !== "result" || event.is_error) return null;
+  const status = event.api_error_status;
+  if (typeof status !== "number" || status < 500) return null;
+  return status === 529
+    ? "Anthropic is overloaded (529) and Claude Code gave up after its own retries. Try again shortly."
+    : `Anthropic returned ${status} and Claude Code gave up after its own retries. Try again shortly.`;
 }
 
 /**

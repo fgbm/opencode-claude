@@ -28,6 +28,7 @@ import {
   failureStatusFor,
   failureTypeFor,
   metaFailureText,
+  overloadedResultText,
   resultErrorText,
   thrownErrorText,
 } from "./failure.js";
@@ -1818,7 +1819,10 @@ function rawProbeKind(event: unknown): "content" | "error" | "neutral" {
   if (e.type === "assistant") {
     return assistantErrorText(e) ? "error" : "content";
   }
-  if (e.type === "result") return e.is_error ? "error" : "content";
+  if (e.type === "result") {
+    // Nothing reached the probe yet, so a 5xx "success" produced nothing.
+    return e.is_error || overloadedResultText(e) ? "error" : "content";
+  }
   if (e.type === "stream_event" && e.event && typeof e.event === "object") {
     const ev = e.event as Record<string, unknown>;
     if (
@@ -1855,7 +1859,7 @@ function rawErrorText(event: unknown): string {
   const e = (event ?? {}) as Record<string, unknown>;
   const assistantText = assistantErrorText(e);
   if (assistantText) return assistantText;
-  return resultErrorText(e);
+  return overloadedResultText(e) ?? resultErrorText(e);
 }
 
 async function* chainBuffered(
@@ -2330,6 +2334,8 @@ type MapState = {
   refusalText?: string;
   /** CLI warnings already shown in this response, so each shows once. */
   shownNotices?: Set<string>;
+  /** This response carried answer text or tool calls. */
+  producedContent?: boolean;
 };
 
 /**
@@ -2406,6 +2412,7 @@ function mapSdkEvent(event: unknown, state?: MapState): MappedEvent {
   const e = event as Record<string, unknown>;
 
   if (e.type === "__park__" && Array.isArray(e.tools)) {
+    if (state) state.producedContent = true;
     return { kind: "park", tools: e.tools as ParkedToolCall[] };
   }
 
@@ -2478,6 +2485,7 @@ function mapSdkEvent(event: unknown, state?: MapState): MappedEvent {
     if (ev.type === "content_block_delta" && ev.delta && typeof ev.delta === "object") {
       const delta = ev.delta as Record<string, unknown>;
       if (delta.type === "text_delta" && typeof delta.text === "string") {
+        if (state && delta.text) state.producedContent = true;
         return { kind: "text", text: delta.text };
       }
       if (
@@ -2537,6 +2545,12 @@ function mapSdkEvent(event: unknown, state?: MapState): MappedEvent {
   if (e.type === "result") {
     const usage = usageFromSdkResult(event);
     if (state && typeof e.stop_reason === "string") state.stopReason = e.stop_reason;
+    // An overload the CLI reported as success. With an answer already out
+    // it is only a late hiccup; with nothing out it is the turn's failure.
+    const overloaded = overloadedResultText(e);
+    if (overloaded && !state?.producedContent) {
+      return { kind: "error", text: overloaded, usage };
+    }
     if (e.is_error) {
       const text = resultErrorText(e);
       // Hard subscription limit? Record it so the gate + counter activate.
@@ -2561,6 +2575,7 @@ function mapSdkEvent(event: unknown, state?: MapState): MappedEvent {
 
   // Fallback for SDK builds that emit bare text deltas without stream_event
   if (typeof e.text === "string" && e.type === "text_delta") {
+    if (state && e.text) state.producedContent = true;
     return { kind: "text", text: e.text };
   }
 
