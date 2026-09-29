@@ -8,6 +8,7 @@
  * - rate_limit       → 429 + Retry-After (the gate store already knows the reset)
  * - context_overflow → 400 context_length_exceeded (OpenCode compacts the chat)
  * - image            → 400 (the same image fails the same way on retry)
+ * - refusal          → 400 refusal (Claude declined; a retry is refused too)
  * - unknown          → 500
  */
 import { isClaudeRateLimitText } from "./rate-limit.js";
@@ -17,6 +18,7 @@ export type ClaudeFailureKind =
   | "rate_limit"
   | "context_overflow"
   | "image"
+  | "refusal"
   | "unknown";
 
 const AUTH_FAILURE_PATTERN =
@@ -33,8 +35,12 @@ const CONTEXT_OVERFLOW_PATTERN =
 const IMAGE_FAILURE_PATTERN =
   /could not process image|\bimage\b[^\n]*?\b(?:exceeds?|too large|could not be processed|is not valid|invalid|unsupported|not supported|dimensions)\b/i;
 
+/** Prefix of the proxy's own text for a refusal no fallback model retried. */
+const REFUSAL_PATTERN = /^Claude declined this request\b/;
+
 export function classifyClaudeFailure(text: string): ClaudeFailureKind {
   if (!text) return "unknown";
+  if (REFUSAL_PATTERN.test(text)) return "refusal";
   if (isClaudeRateLimitText(text)) return "rate_limit";
   if (AUTH_FAILURE_PATTERN.test(text)) return "auth";
   if (CONTEXT_OVERFLOW_PATTERN.test(text)) return "context_overflow";
@@ -50,6 +56,7 @@ export function failureStatusFor(kind: ClaudeFailureKind): number {
       return 429;
     case "context_overflow":
     case "image":
+    case "refusal":
       return 400;
     default:
       return 500;
@@ -64,6 +71,7 @@ export function failureTypeFor(kind: ClaudeFailureKind): string {
       return "rate_limit_error";
     case "context_overflow":
     case "image":
+    case "refusal":
       return "invalid_request_error";
     default:
       return "server_error";
@@ -81,6 +89,9 @@ export function failureCodeFor(kind: ClaudeFailureKind): string {
       return "context_length_exceeded";
     case "image":
       return "claude_image_error";
+    // OpenCode reads this code as a content-policy block, not a retry.
+    case "refusal":
+      return "refusal";
     default:
       return "claude_turn_failed";
   }

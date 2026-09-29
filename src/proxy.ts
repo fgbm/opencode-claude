@@ -1754,7 +1754,13 @@ async function collectTurnResponse(
     errorText &&
     (!sawContent || failureKind === "rate_limit" || failureKind === "context_overflow")
   ) {
-    return failureResponse(errorText, bridge.conversationKey, bridge.metaKind);
+    // The refusal is the real cause; the failure after it only says the
+    // turn produced nothing.
+    return failureResponse(
+      mapState.refusalText ?? errorText,
+      bridge.conversationKey,
+      bridge.metaKind,
+    );
   }
 
   const finishReason = toolCalls.length
@@ -1877,18 +1883,24 @@ async function probeTurnEvents(
 ): Promise<TurnProbe> {
   const iterator = events[Symbol.asyncIterator]();
   const buffered: unknown[] = [];
+  // A refusal without fallback, when the turn then fails, is the cause.
+  let refusal: string | null = null;
   const fail = async (errorText: string): Promise<TurnProbe> => {
     try {
       await iterator.return?.(undefined as never);
     } catch {
       // ignore
     }
-    return { status: "failed", errorText };
+    return { status: "failed", errorText: refusal ?? errorText };
   };
   try {
     while (true) {
       const next = await iterator.next();
       if (next.done) break;
+      const raw = next.value as Record<string, unknown> | null;
+      if (raw?.type === "system" && raw.subtype === "model_refusal_no_fallback") {
+        refusal = refusalText(raw as Parameters<typeof refusalText>[0]);
+      }
       const kind = rawProbeKind(next.value);
       if (kind === "error") {
         return fail(rawErrorText(next.value));
@@ -2314,7 +2326,60 @@ type MapState = {
   stopReason?: string | null;
   /** A refusal was already explained to the user in this response. */
   refusalNoted?: boolean;
+  /** Why Claude refused, when the CLI said so (model_refusal_no_fallback). */
+  refusalText?: string;
+  /** CLI warnings already shown in this response, so each shows once. */
+  shownNotices?: Set<string>;
 };
+
+/**
+ * Claude refused and no fallback model retried the request. The CLI's
+ * api_refusal_explanation is the API's own reason; `content` is its notice.
+ */
+export function refusalText(event: {
+  api_refusal_explanation?: string | null;
+  api_refusal_category?: string | null;
+  content?: string;
+}): string {
+  const why = event.api_refusal_explanation?.trim() || event.content?.trim();
+  const category = event.api_refusal_category ? ` (${event.api_refusal_category})` : "";
+  return `Claude declined this request${category}${why ? `: ${why}` : "."}`;
+}
+
+/**
+ * CLI notices worth a line in the reasoning stream: high-priority
+ * notifications (context-limit warnings and the like) and warning-level
+ * informational messages (a Stop hook refused to continue). Everything
+ * else is Claude Code UI chrome. Each shows once per response.
+ */
+function cliNotice(e: Record<string, unknown>, state: MapState | undefined): string | null {
+  let key: string | null = null;
+  let text: string | null = null;
+  if (
+    e.subtype === "notification" &&
+    (e.priority === "high" || e.priority === "immediate") &&
+    typeof e.text === "string" &&
+    e.text.trim()
+  ) {
+    key = `notification:${typeof e.key === "string" ? e.key : e.text}`;
+    text = e.text.trim();
+  } else if (
+    e.subtype === "informational" &&
+    e.level === "warning" &&
+    typeof e.content === "string" &&
+    e.content.trim()
+  ) {
+    text = e.content.trim();
+    key = `informational:${text}`;
+  }
+  if (!key || !text) return null;
+  if (state) {
+    state.shownNotices ??= new Set();
+    if (state.shownNotices.has(key)) return null;
+    state.shownNotices.add(key);
+  }
+  return `\n[claude-code] ${text}\n`;
+}
 
 /**
  * OpenAI finish_reason for a response that ended without tool calls.
@@ -2356,6 +2421,20 @@ function mapSdkEvent(event: unknown, state?: MapState): MappedEvent {
     const state = recordRateLimitInfo(rawInfo);
     const note = maybeRateLimitNote(state, rawInfo);
     return note ? { kind: "reasoning", text: note } : { kind: "ignore" };
+  }
+
+  if (e.type === "system" && e.subtype === "model_refusal_no_fallback") {
+    const text = refusalText(e as Parameters<typeof refusalText>[0]);
+    if (state) {
+      state.refusalNoted = true;
+      state.refusalText = text;
+    }
+    return { kind: "reasoning", text: `\n[refusal] ${text}\n` };
+  }
+
+  if (e.type === "system") {
+    const notice = cliNotice(e, state);
+    if (notice) return { kind: "reasoning", text: notice };
   }
 
   if (e.type === "system" && e.subtype === "model_refusal_fallback") {
