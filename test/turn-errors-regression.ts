@@ -13,6 +13,7 @@
  */
 import {
   classifyClaudeFailure,
+  failureStatusFor,
   resultErrorText,
   thrownErrorText,
 } from "../src/failure.ts";
@@ -51,6 +52,10 @@ async function main() {
   );
   assert.equal(thrownErrorText(new Error("spawn failed")), "spawn failed");
   assert.equal(classifyClaudeFailure("Prompt is too long"), "context_overflow");
+  // Anthropic moving third-party usage off the plan is an account decision:
+  // 402, which OpenCode doesn't retry, never a retryable 500.
+  assert.equal(classifyClaudeFailure("API Error: 400 Third-party apps now draw from extra usage, not plan limits"), "billing");
+  assert.equal(failureStatusFor("billing"), 402);
   assert.equal(classifyClaudeFailure('API Error: 400 {"error":{"message":"prompt is too long: 210000 tokens > 200000 maximum"}}'), "context_overflow");
   assert.equal(classifyClaudeFailure("API Error: 400 messages.0.content.1.image.source.base64: image exceeds 5 MB maximum"), "image");
   assert.equal(classifyClaudeFailure("Could not process image"), "image");

@@ -8,6 +8,8 @@
  * - rate_limit       → 429 + Retry-After (the gate store already knows the reset)
  * - context_overflow → 400 context_length_exceeded (OpenCode compacts the chat)
  * - image            → 400 (the same image fails the same way on retry)
+ * - billing          → 402 (Anthropic moved this usage off the plan; retrying
+ *                      can't change that, only the user's account settings can)
  * - refusal          → 400 refusal (Claude declined; a retry is refused too)
  * - overloaded       → 503 overloaded_error (retryable; OpenCode backs off)
  * - unknown          → 500
@@ -21,6 +23,7 @@ export type ClaudeFailureKind =
   | "image"
   | "refusal"
   | "overloaded"
+  | "billing"
   | "unknown";
 
 const AUTH_FAILURE_PATTERN =
@@ -33,6 +36,14 @@ const AUTH_FAILURE_PATTERN =
  */
 const CONTEXT_OVERFLOW_PATTERN =
   /prompt is too long|exceeds the context window|context[_ ]length[_ ]exceeded|exceeds (?:the )?(?:model'?s )?maximum context length|input is too long for requested model|model_context_window_exceeded/i;
+
+/**
+ * Anthropic refusing to count this usage against the plan ("Third-party
+ * apps now draw from extra usage, not plan limits"), or extra usage being
+ * off or exhausted. A billing decision on the account, not a transient error.
+ */
+const BILLING_FAILURE_PATTERN =
+  /draw from extra usage|extra usage (?:is )?(?:not enabled|disabled|required|exhausted|limit)|out of extra usage|credit balance is too low/i;
 
 const IMAGE_FAILURE_PATTERN =
   /could not process image|\bimage\b[^\n]*?\b(?:exceeds?|too large|could not be processed|is not valid|invalid|unsupported|not supported|dimensions)\b/i;
@@ -49,6 +60,7 @@ export function classifyClaudeFailure(text: string): ClaudeFailureKind {
   if (OVERLOADED_PATTERN.test(text)) return "overloaded";
   if (isClaudeRateLimitText(text)) return "rate_limit";
   if (AUTH_FAILURE_PATTERN.test(text)) return "auth";
+  if (BILLING_FAILURE_PATTERN.test(text)) return "billing";
   if (CONTEXT_OVERFLOW_PATTERN.test(text)) return "context_overflow";
   if (IMAGE_FAILURE_PATTERN.test(text)) return "image";
   return "unknown";
@@ -66,6 +78,8 @@ export function failureStatusFor(kind: ClaudeFailureKind): number {
       return 400;
     case "overloaded":
       return 503;
+    case "billing":
+      return 402;
     default:
       return 500;
   }
@@ -81,6 +95,8 @@ export function failureTypeFor(kind: ClaudeFailureKind): string {
     case "image":
     case "refusal":
       return "invalid_request_error";
+    case "billing":
+      return "billing_error";
     default:
       return "server_error";
   }
@@ -97,6 +113,8 @@ export function failureCodeFor(kind: ClaudeFailureKind): string {
       return "context_length_exceeded";
     case "image":
       return "claude_image_error";
+    case "billing":
+      return "claude_extra_usage";
     // OpenCode reads this code as a content-policy block, not a retry.
     case "refusal":
       return "refusal";
