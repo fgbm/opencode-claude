@@ -9,6 +9,7 @@
  * tool_calls; the follow-up request with tool results resumes the turn.
  */
 import { createHash, randomUUID } from "node:crypto";
+import { currentHost, mcpToolName, openCodeToolName } from "./host.js";
 import {
   clearAllBridges,
   deleteBridge,
@@ -531,7 +532,7 @@ function selectionFromRequest(
 const META_REQUEST_MODEL = "claude-haiku-4-5";
 
 const UTILITY_SYSTEM_PROMPT =
-  "You are a text generation helper running in OpenChamber through the Claude Code harness. Follow the instructions in the user message and return only the requested output.";
+  `You are a text generation helper running in ${currentHost().name} through the Claude Code harness. Follow the instructions in the user message and return only the requested output.`;
 
 /**
  * One debug line per finished Claude run with the raw token split, so plan
@@ -899,7 +900,7 @@ async function startNewTurn(input: {
         ev.content_block?.type === "tool_use" &&
         typeof ev.content_block.name === "string"
       ) {
-        messageToolNames.push(ev.content_block.name.replace(/^mcp__opencode__/, ""));
+        messageToolNames.push(openCodeToolName(ev.content_block.name));
       }
     }
   };
@@ -1123,7 +1124,7 @@ async function startNewTurn(input: {
   const toolAliases = bridgeOpenCodeTools
     ? Object.fromEntries(
         openCodeToolNames.flatMap((name) => {
-          const mcpName = `mcp__opencode__${name}`;
+          const mcpName = mcpToolName(name);
           const aliases: Array<[string, string]> = [[name, mcpName]];
           const titled = name.charAt(0).toUpperCase() + name.slice(1);
           if (titled !== name) aliases.push([titled, mcpName]);
@@ -1213,7 +1214,7 @@ async function startNewTurn(input: {
     tools: [],
     toolAliases,
     allowedTools: bridgeOpenCodeTools
-      ? openCodeToolNames.map((n) => `mcp__opencode__${n}`)
+      ? openCodeToolNames.map((n) => mcpToolName(n))
       : undefined,
     permissionMode: bridgeOpenCodeTools ? "bypassPermissions" : "dontAsk",
     allowDangerouslySkipPermissions: bridgeOpenCodeTools,
@@ -1233,18 +1234,18 @@ async function startNewTurn(input: {
             ...(bridgeOpenCodeTools
               ? [
                   [
-                    "Built-in Claude Code tools are disabled. Use only the mcp__opencode__* tools provided for this turn; they execute via OpenCode.",
+                    `Built-in Claude Code tools are disabled. Use only the ${mcpToolName("*")} tools provided for this turn; they execute via OpenCode.`,
                     "Batch independent tool calls into a single turn instead of calling them one at a time.",
                     ...(hasTodoWrite
                       ? [
-                          "For any multi-step work, ALWAYS write the plan with the mcp__opencode__todowrite tool and keep it updated as you progress. A plan that only exists in your text is lost when the session is restored or handed to another agent.",
+                          `For any multi-step work, ALWAYS write the plan with the ${mcpToolName("todowrite")} tool and keep it updated as you progress. A plan that only exists in your text is lost when the session is restored or handed to another agent.`,
                         ]
                       : []),
                   ].join(" "),
                 ]
               : []),
             ...(bridgeOpenCodeTools && codeMode
-              ? [`${codeMode}\n\nThe \`execute\` tool above is mcp__opencode__execute.`]
+              ? [`${codeMode}\n\nThe \`execute\` tool above is ${mcpToolName("execute")}.`]
               : []),
           ].join("\n\n"),
         },
@@ -1705,7 +1706,7 @@ export async function buildOpenCodeMcpServer(
       .filter(Boolean);
 
     const server = createSdkMcpServer({
-      name: "opencode",
+      name: currentHost().mcpServer,
       alwaysLoad: true,
       tools: mcpTools,
     }) as { instance?: { server?: { setRequestHandler?: Function } } };
@@ -1721,7 +1722,7 @@ export async function buildOpenCodeMcpServer(
       );
     }
 
-    return { opencode: server };
+    return { [currentHost().mcpServer]: server };
   } catch (err) {
     log.warn(
       "[opencode-claude] failed to build OpenCode MCP server",

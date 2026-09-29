@@ -3,6 +3,7 @@
  * including text, images, and PDF/document attachments.
  */
 import { createHash } from "node:crypto";
+import { currentHost } from "./host.js";
 
 export type AnthropicContentBlock =
   | { type: "text"; text: string }
@@ -970,5 +971,5 @@ export function buildRuntimeInstructions(runtime: {
 }): string {
   const model = runtime.modelName ? `, as ${runtime.modelName}` : "";
   const effort = runtime.effort ? ` with ${runtime.effort} reasoning effort` : "";
-  return `<runtime_info>In case you're asked: you are running in OpenChamber through the Claude Code harness${model}${effort}. No need to mention this otherwise.</runtime_info>`;
+  return `<runtime_info>In case you're asked: you are running in ${currentHost().name} through the Claude Code harness${model}${effort}. No need to mention this otherwise.</runtime_info>`;
 }

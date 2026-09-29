@@ -1216,7 +1216,7 @@ async function main() {
       // Utility turns get a one-line prompt that names the host
       assert.match(
         String(titleOptions!.systemPrompt),
-        /^You are a text generation helper running in OpenChamber through the Claude Code harness\./,
+        /^You are a text generation helper running in OpenCode through the Claude Code harness\./,
       );
       assert.match(String(titleOptions!.prompt), /<request>\nExplain how binary search trees work\n<\/request>/);
     } finally {
@@ -1466,7 +1466,7 @@ async function main() {
       assert.match(sysPrompt.append ?? "", /[Bb]atch independent tool calls/);
       assert.match(
         sysPrompt.append ?? "",
-        /^<runtime_info>In case you're asked: you are running in OpenChamber through the Claude Code harness/,
+        /^<runtime_info>In case you're asked: you are running in OpenCode through the Claude Code harness/,
       );
       assert.equal((seenParams.systemPrompt as { preset?: string }).preset, "claude_code");
 

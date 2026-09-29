@@ -19,7 +19,7 @@ The plugin is built to stay inside those rules:
 
 - **Claude Code does all the talking to Anthropic.** The plugin calls the Agent SDK, the SDK runs your local `claude` CLI, and the CLI sends the requests. The plugin makes no calls to Anthropic itself.
 - **Your login stays with Claude Code.** Sign-in is `claude auth login`, run by the CLI. The plugin never reads, copies, stores or sends tokens.
-- **No disguise.** Claude is told plainly that it runs in OpenChamber through the Claude Code harness. The plugin doesn't fake headers, rewrite Claude Code's system prompt, or hide that it's a third-party app.
+- **No disguise.** Claude is told plainly that it runs in OpenChamber (or OpenCode, when OpenChamber didn't start it) through the Claude Code harness, and its tools are named after that app. The plugin doesn't fake headers, rewrite Claude Code's system prompt, or hide that it's a third-party app.
 - **One person, one machine.** The proxy the plugin starts listens on `127.0.0.1` only and refuses requests from web pages. Don't expose it or share your plan with other people.
 - **Limits are respected.** When your plan hits a limit, you see the real error and the reset time. The plugin doesn't retry into a limit or route around it.
 - **Plans only.** If `claude` is signed in with a Console API key, or set up for Bedrock or Vertex, the plugin refuses. For API keys, use OpenCode's built-in Anthropic provider instead.
