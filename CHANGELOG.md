@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.3.0 - 2026-09-30
+
+- **Claude no longer forgets part of a chat**: after an OpenCode restart, a
+  leftover `claude` process could write into the same Claude session and
+  fork it, and the next message resumed the wrong branch. The plugin now
+  remembers where its conversation ends and resumes exactly there, stops an
+  earlier turn properly before starting the next one, and never runs two
+  processes on one session.
+- **Revert and edit reach Claude**: after reverting or editing a message in
+  OpenCode, Claude continues from that point instead of remembering the
+  undone turns. If an old message changed, the history is sent as text.
+- **Real error messages**: failed turns show Claude Code's actual reason
+  instead of "Claude turn failed". A chat that outgrew the context window
+  makes OpenCode compact instead of retrying the same request, image errors
+  aren't retried, and refusals say why.
+- **Truncated answers look truncated**: a reply cut at the token limit ends
+  as `length`, a refusal as `content_filter`, not as a normal finish.
+- **Overload and retries are visible**: Claude Code's retries show up in
+  the reasoning, long retry pauses no longer kill the turn, and an overload
+  reported as an empty success becomes a 503 that OpenCode retries.
+- **Extra usage errors aren't retried**: when Anthropic answers "Third-party
+  apps now draw from extra usage", you see it once instead of a retry loop.
+- **Tools named after the app**: under OpenChamber the tools are
+  `mcp__openchamber__*` and Claude is told it runs in OpenChamber; in plain
+  OpenCode both say OpenCode.
+- Removed the leftover todo tool aliases and plan prompt from OpenCode 1.x,
+  and the session store is written only when something changes.
+
 ## 1.2.3 - 2026-09-27
 
 - **Fix: Claude didn't know about MCP and OpenChamber tools**: OpenCode 2.x
