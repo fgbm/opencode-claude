@@ -1134,10 +1134,6 @@ async function startNewTurn(input: {
           if (name === "write") aliases.push(["Write", mcpName]);
           if (name === "glob") aliases.push(["Glob", mcpName]);
           if (name === "grep") aliases.push(["Grep", mcpName]);
-          // Claude Code's built-in todo habit must land on OpenCode's todo
-          // tools or plans die with the turn (never persisted/transferred).
-          if (name === "todowrite") aliases.push(["TodoWrite", mcpName]);
-          if (name === "todoread") aliases.push(["TodoRead", mcpName]);
           return aliases;
         }),
       )
@@ -1179,7 +1175,6 @@ async function startNewTurn(input: {
       ? mainPrompt || " "
       : promptAsStream(mainPrompt);
 
-  const hasTodoWrite = openCodeToolNames.includes("todowrite");
   const codeMode = openCodeToolNames.includes("execute") ? codeModeCatalog(messages) : "";
   // Generation is an explicit model choice by the caller; keep it.
   const queryModel =
@@ -1236,11 +1231,6 @@ async function startNewTurn(input: {
                   [
                     `Built-in Claude Code tools are disabled. Use only the ${mcpToolName("*")} tools provided for this turn; they execute via OpenCode.`,
                     "Batch independent tool calls into a single turn instead of calling them one at a time.",
-                    ...(hasTodoWrite
-                      ? [
-                          `For any multi-step work, ALWAYS write the plan with the ${mcpToolName("todowrite")} tool and keep it updated as you progress. A plan that only exists in your text is lost when the session is restored or handed to another agent.`,
-                        ]
-                      : []),
                   ].join(" "),
                 ]
               : []),

@@ -1357,7 +1357,7 @@ async function main() {
       __resetRateLimitNoteDedupe();
 
       // Proxy + mock SDK: successful turn streams text, note, usage — and the
-      // todowrite alias + plan-persistence prompt reach the query starter.
+      // Tool aliases and the tool note reach the query starter.
       __resetRateLimitNoteDedupe();
       let seenParams: Record<string, unknown> | null = null;
       setClaudeQueryStarter(async (params) => {
@@ -1454,15 +1454,16 @@ async function main() {
       assert.match(okReasoning, /99%/);
       assert.equal(okJson.usage?.prompt_tokens, 11);
 
-      // Query starter received the todo alias + plan-persistence append
+      // Query starter received the aliases and the tool note
       assert.ok(seenParams, "query starter params captured");
       assert.equal(seenParams.cwd, "/data/projects/infra");
       const aliases = (seenParams as { toolAliases?: Record<string, string> })
         .toolAliases;
-      assert.equal(aliases?.TodoWrite, "mcp__opencode__todowrite");
+      // OpenCode 2 has no todo tools; no Claude Code todo alias or plan nag.
+      assert.equal(aliases?.TodoWrite, undefined);
       assert.equal(aliases?.todowrite, "mcp__opencode__todowrite");
       const sysPrompt = seenParams.systemPrompt as { append?: string };
-      assert.match(sysPrompt.append ?? "", /mcp__opencode__todowrite/);
+      assert.doesNotMatch(sysPrompt.append ?? "", /todowrite/);
       assert.match(sysPrompt.append ?? "", /[Bb]atch independent tool calls/);
       assert.match(
         sysPrompt.append ?? "",
