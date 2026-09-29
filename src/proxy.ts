@@ -1757,6 +1757,15 @@ async function collectTurnResponse(
     return failureResponse(errorText, bridge.conversationKey, bridge.metaKind);
   }
 
+  const finishReason = toolCalls.length
+    ? "tool_calls"
+    : errorText
+      ? "stop"
+      : finishReasonFor(mapState.stopReason);
+  if (finishReason === "content_filter" && !suppressReasoning) {
+    reasoning += refusalNote(mapState) ?? "";
+  }
+
   return Response.json({
     id: completionId,
     object: "chat.completion",
@@ -1779,7 +1788,7 @@ async function collectTurnResponse(
               }
             : {}),
         },
-        finish_reason: toolCalls.length ? "tool_calls" : "stop",
+        finish_reason: finishReason,
       },
     ],
     ...(usage ? { usage } : {}),
@@ -2184,6 +2193,19 @@ function streamOpenAIResponse(
         finishReason = "stop";
       }
 
+      if (finishReason === "stop" && !lastErrorNorm) {
+        finishReason = finishReasonFor(mapState.stopReason);
+        const note = finishReason === "content_filter" ? refusalNote(mapState) : null;
+        if (note && !suppressReasoning) {
+          send({
+            id: completionId,
+            object: "chat.completion.chunk",
+            created,
+            model,
+            choices: [{ index: 0, delta: { reasoning_content: note }, finish_reason: null }],
+          });
+        }
+      }
       const usage = resolveTurnUsage(usageTracker.total(), resultUsage);
       if (!streamClosed) {
         send({
@@ -2286,7 +2308,33 @@ function forgetDeadSession(conversationKey: string, errorText: string): void {
  * `assistant` message payloads repeat the same content after partials and
  * would double-print if both were forwarded.
  */
-type MapState = { messageId: string | null };
+type MapState = {
+  messageId: string | null;
+  /** Claude's stop_reason for the main conversation, latest wins. */
+  stopReason?: string | null;
+  /** A refusal was already explained to the user in this response. */
+  refusalNoted?: boolean;
+};
+
+/**
+ * OpenAI finish_reason for a response that ended without tool calls.
+ * OpenCode treats "length" as a truncated answer and "content_filter" as a
+ * blocked one; everything else is a normal stop.
+ */
+export function finishReasonFor(stopReason: string | null | undefined): string {
+  if (stopReason === "max_tokens") return "length";
+  if (stopReason === "refusal") return "content_filter";
+  return "stop";
+}
+
+const REFUSAL_NOTE = "\n[refusal] Claude declined to answer this request.\n";
+
+/** Note to show when the response ends on a refusal nobody explained yet. */
+function refusalNote(state: MapState): string | null {
+  if (state.stopReason !== "refusal" || state.refusalNoted) return null;
+  state.refusalNoted = true;
+  return REFUSAL_NOTE;
+}
 
 function mapSdkEvent(event: unknown, state?: MapState): MappedEvent {
   if (!event || typeof event !== "object") return { kind: "ignore" };
@@ -2339,6 +2387,10 @@ function mapSdkEvent(event: unknown, state?: MapState): MappedEvent {
       return usage ? { kind: "usage-delta", usage, messageId: id } : { kind: "ignore" };
     }
     if (ev.type === "message_delta") {
+      const stopReason = (ev.delta as { stop_reason?: unknown } | undefined)?.stop_reason;
+      if (state && !e.parent_tool_use_id && typeof stopReason === "string") {
+        state.stopReason = stopReason;
+      }
       const usage = usageFromAnthropic(ev.usage);
       return usage
         ? { kind: "usage-delta", usage, messageId: state?.messageId ?? null }
@@ -2405,6 +2457,7 @@ function mapSdkEvent(event: unknown, state?: MapState): MappedEvent {
 
   if (e.type === "result") {
     const usage = usageFromSdkResult(event);
+    if (state && typeof e.stop_reason === "string") state.stopReason = e.stop_reason;
     if (e.is_error) {
       const text = resultErrorText(e);
       // Hard subscription limit? Record it so the gate + counter activate.
