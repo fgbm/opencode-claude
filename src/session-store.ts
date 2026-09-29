@@ -2,7 +2,17 @@
  * Sticky foreign Claude session IDs for Agent SDK resume
  * (OpenChamber harness session-bindings pattern, scoped to this proxy).
  */
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  fstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  readdirSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -59,37 +69,90 @@ export function getSessionLeafUuid(conversationKey: string): string | undefined 
   return readStore()[conversationKey]?.leafUuid;
 }
 
+/**
+ * What this process last wrote per conversation. Every streamed event of a
+ * turn reports the session id, and most carry no new leaf: comparing with
+ * this skips the read-modify-write of sessions.json for them.
+ */
+const written = new Map<string, Omit<ClaudeSessionBinding, "updatedAt">>();
+
+function sameBinding(
+  a: Omit<ClaudeSessionBinding, "updatedAt"> | undefined,
+  b: Omit<ClaudeSessionBinding, "updatedAt">,
+): boolean {
+  return (
+    !!a &&
+    a.foreignSessionId === b.foreignSessionId &&
+    a.leafUuid === b.leafUuid &&
+    a.modelId === b.modelId &&
+    a.cwd === b.cwd
+  );
+}
+
 export function setForeignSessionId(
   conversationKey: string,
   foreignSessionId: string,
   meta?: { modelId?: string; cwd?: string; leafUuid?: string },
 ): void {
-  const store = readStore();
-  const previous = store[conversationKey];
-  // A new session id starts a new chain; the old leaf means nothing there.
-  const keptLeaf =
-    previous?.foreignSessionId === foreignSessionId ? previous.leafUuid : undefined;
-  store[conversationKey] = {
+  const binding = (previous: Omit<ClaudeSessionBinding, "updatedAt"> | undefined) => ({
     conversationKey,
     foreignSessionId,
     modelId: meta?.modelId,
     cwd: meta?.cwd,
-    leafUuid: meta?.leafUuid ?? keptLeaf,
-    updatedAt: Date.now(),
-  };
+    // A new session id starts a new chain; the old leaf means nothing there.
+    leafUuid:
+      meta?.leafUuid ??
+      (previous?.foreignSessionId === foreignSessionId ? previous.leafUuid : undefined),
+  });
+  const cached = written.get(conversationKey);
+  if (cached && sameBinding(cached, binding(cached))) return;
+  const store = readStore();
+  const previous = store[conversationKey];
+  const next = binding(previous);
+  written.set(conversationKey, next);
+  if (sameBinding(previous, next)) return;
+  store[conversationKey] = { ...next, updatedAt: Date.now() };
   writeStore(store);
 }
 
-/** Whether a Claude Code transcript still holds the entry with this uuid. */
-export function sessionFileHasEntry(file: string, uuid: string): boolean {
+/**
+ * Whether a Claude Code transcript still holds the entry with this uuid.
+ * The entry is almost always the resume leaf, near the end of a file that
+ * can reach tens of megabytes, so the file is read backwards in chunks and
+ * the search stops at the first hit.
+ */
+export function sessionFileHasEntry(
+  file: string,
+  uuid: string,
+  chunkBytes = 256 * 1024,
+): boolean {
+  const needle = Buffer.from(`"uuid":"${uuid}"`, "utf8");
+  let fd: number | undefined;
   try {
-    return readFileSync(file, "utf8").includes(`"uuid":"${uuid}"`);
+    fd = openSync(file, "r");
+    let end = fstatSync(fd).size;
+    // Leading bytes of what was read so far (the part after this chunk in
+    // the file), so a match split across a chunk border is still found.
+    let carry = Buffer.alloc(0);
+    while (end > 0) {
+      const start = Math.max(0, end - chunkBytes);
+      const chunk = Buffer.alloc(end - start);
+      readSync(fd, chunk, 0, chunk.length, start);
+      const window = Buffer.concat([chunk, carry]);
+      if (window.includes(needle)) return true;
+      carry = window.subarray(0, Math.min(window.length, needle.length - 1));
+      end = start;
+    }
+    return false;
   } catch {
     return false;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
   }
 }
 
 export function clearForeignSessionId(conversationKey: string): void {
+  written.delete(conversationKey);
   const store = readStore();
   if (!(conversationKey in store)) return;
   delete store[conversationKey];
