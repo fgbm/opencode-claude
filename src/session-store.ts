@@ -118,11 +118,15 @@ export function conversationKeyFromMessages(
 }
 
 /**
- * Locate the Claude Code transcript for a foreign session id. The Agent SDK
- * resumes via the claude CLI, which looks the session up under
- * ~/.claude/projects/<cwd-slug>/ — a missing file means resume silently starts
- * (or errors into) a context-free session, so callers must fall back to
- * history injection instead.
+ * Locate the Claude Code transcript for a foreign session id. A missing file
+ * means resume silently starts (or errors into) a context-free session, so
+ * callers must fall back to history injection instead.
+ *
+ * Every project folder is searched on purpose. The CLI writes a session
+ * under ~/.claude/projects/<slug of the realpath cwd>/, but `--resume <id>`
+ * finds it from any cwd: checked live on CLI 2.1.224 and 2.1.284, a resume
+ * from another directory loaded the full history and appended to the
+ * original file. A chat whose directory changed keeps resuming.
  */
 export function findClaudeSessionFile(
   foreignSessionId: string,

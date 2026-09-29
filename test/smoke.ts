@@ -12,6 +12,8 @@ async function main() {
   process.env.XDG_DATA_HOME = mkdtempSync(`${tmpdir()}/opencode-claude-smoke-`);
   // Mocked turns ignore interrupt(); don't wait the real grace for them.
   process.env.OPENCODE_CLAUDE_STOP_GRACE_MS = "50";
+  // Fake Claude transcripts go to a temp config dir, never ~/.claude.
+  process.env.CLAUDE_CONFIG_DIR = mkdtempSync(`${tmpdir()}/opencode-claude-smoke-cfg-`);
   const { buildClaudeCodeChildEnv } = await import("../src/auth-env.ts");
   const {
     interpretClaudeAuthStatus,
@@ -1762,7 +1764,7 @@ async function main() {
     const { mkdirSync, rmSync, writeFileSync, mkdtempSync } = await import(
       "node:fs"
     );
-    const { homedir, tmpdir } = await import("node:os");
+    const { tmpdir } = await import("node:os");
     const { join: joinPath } = await import("node:path");
 
     // Isolate the rate-limit store: this block mocks healthy turns, so a
@@ -1845,8 +1847,7 @@ async function main() {
 
       // 2. Stored binding whose transcript file EXISTS → resume, no injection
       const fakeProjectsDir = joinPath(
-        homedir(),
-        ".claude",
+        process.env.CLAUDE_CONFIG_DIR!,
         "projects",
         "opencode-claude-smoke",
       );
