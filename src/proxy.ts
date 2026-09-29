@@ -1253,6 +1253,8 @@ async function startNewTurn(input: {
     let handedOff = false;
     // The settle window ran out: hand off whatever the group has.
     let settled = false;
+    // Delay the CLI announced for its next API retry.
+    let retryWaitMs = 0;
     try {
       while (true) {
         // Parked and the message is closed: hand every collected call to
@@ -1299,7 +1301,8 @@ async function startNewTurn(input: {
         // session forever. Any event — or a park — resets the clock.
         let stallTimer: ReturnType<typeof setTimeout> | null = null;
         const stallPromise = new Promise<never>((_, reject) => {
-          const ms = turnStallMs();
+          // An API retry announces its wait; that silence is expected.
+          const ms = turnStallMs() + retryWaitMs;
           const span =
             ms < 90_000
               ? `${Math.round(ms / 1000)}s`
@@ -1356,6 +1359,7 @@ async function startNewTurn(input: {
         if (raced.value.done) break;
         const event = raced.value.value;
         trackMessageState(event);
+        retryWaitMs = apiRetryDelayMs(event);
         logTurnUsage(event, { conversationKey, metaKind, model: queryModel });
         const fallback = event as {
           type?: string;
@@ -1816,6 +1820,12 @@ function rawProbeKind(event: unknown): "content" | "error" | "neutral" {
   if (!event || typeof event !== "object") return "neutral";
   const e = event as Record<string, unknown>;
   if (e.type === "__park__") return "content";
+  // system events (api_retry included) stay neutral: the CLI retrying is
+  // not proof the turn will produce anything, and if its retries run out
+  // the failure must still become a real HTTP error. The retry notes are
+  // buffered and replayed once content arrives. OpenCode sets no response
+  // header timeout by default, so holding the head meanwhile is safe, and
+  // each retry resets the stall watchdog (plus the announced delay).
   if (e.type === "assistant") {
     return assistantErrorText(e) ? "error" : "content";
   }
@@ -2339,6 +2349,30 @@ type MapState = {
 };
 
 /**
+ * The CLI hit a retryable API error and retries on its own (up to
+ * max_retries). error_status is null for connection errors.
+ */
+export function apiRetryNote(event: Record<string, unknown>): string {
+  const status = typeof event.error_status === "number" ? event.error_status : null;
+  const what = status ? `Anthropic returned ${status}` : "Connection to Anthropic failed";
+  const delay = Number(event.retry_delay_ms);
+  const wait = Number.isFinite(delay) && delay >= 1000 ? ` in ${Math.round(delay / 1000)}s` : "";
+  const attempt = Number(event.attempt);
+  const max = Number(event.max_retries);
+  const count =
+    Number.isFinite(attempt) && Number.isFinite(max) && max > 0 ? ` (attempt ${attempt}/${max})` : "";
+  return `\n[api] ${what}, retrying${wait}${count}\n`;
+}
+
+/** Wait an api_retry event announces before the next attempt, else 0. */
+function apiRetryDelayMs(event: unknown): number {
+  const e = event as { type?: unknown; subtype?: unknown; retry_delay_ms?: unknown } | null;
+  if (e?.type !== "system" || e.subtype !== "api_retry") return 0;
+  const delay = Number(e.retry_delay_ms);
+  return Number.isFinite(delay) && delay > 0 ? delay : 0;
+}
+
+/**
  * Claude refused and no fallback model retried the request. The CLI's
  * api_refusal_explanation is the API's own reason; `content` is its notice.
  */
@@ -2428,6 +2462,10 @@ function mapSdkEvent(event: unknown, state?: MapState): MappedEvent {
     const state = recordRateLimitInfo(rawInfo);
     const note = maybeRateLimitNote(state, rawInfo);
     return note ? { kind: "reasoning", text: note } : { kind: "ignore" };
+  }
+
+  if (e.type === "system" && e.subtype === "api_retry") {
+    return { kind: "reasoning", text: apiRetryNote(e) };
   }
 
   if (e.type === "system" && e.subtype === "model_refusal_no_fallback") {
