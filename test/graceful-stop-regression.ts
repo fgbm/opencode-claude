@@ -13,46 +13,15 @@
 process.env.OPENCODE_CLAUDE_STOP_GRACE_MS = "1000";
 import { closeSessionBridges } from "../src/bridge-pool.ts";
 import { withGracefulStop } from "../src/query.ts";
-import { assert, bashTool, callTool, startMockedProxy, textDelta } from "./helpers.ts";
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-/**
- * Mock SDK turn: runs `body`, and on interrupt() yields what the CLI emits
- * for an interrupted tool call (the rejection, the marker, an aborted_tools
- * result) and ends, like the real CLI does.
- */
-function interruptibleTurn(
-  log: string[],
-  name: string,
-  body: () => AsyncGenerator<unknown>,
-  settleMs = 0,
-) {
-  let interrupted!: () => void;
-  const interruptSignal = new Promise<"interrupt">((r) => (interrupted = () => r("interrupt")));
-  const stream = (async function* () {
-    const inner = body();
-    while (true) {
-      const next = await Promise.race([inner.next(), interruptSignal]);
-      if (next === "interrupt") break;
-      if (next.done) return;
-      yield next.value;
-    }
-    if (settleMs > 0) await sleep(settleMs);
-    yield { type: "user", uuid: `${name}-reject`, parent_tool_use_id: null, message: { content: [] } };
-    yield { type: "user", uuid: `${name}-marker`, parent_tool_use_id: null, message: { content: [] } };
-    yield { type: "result", subtype: "error_during_execution", is_error: true, errors: [], terminal_reason: "aborted_tools" };
-  })();
-  return {
-    stream,
-    interrupt: async () => {
-      log.push(`${name}:interrupt`);
-      interrupted();
-    },
-    close: () => log.push(`${name}:close`),
-    getPid: () => null,
-  };
-}
+import {
+  assert,
+  bashTool,
+  callTool,
+  interruptibleTurn,
+  sleep,
+  startMockedProxy,
+  textDelta,
+} from "./helpers.ts";
 
 async function main() {
   // stop()'s grace timer is unref'd; keep the loop alive like a server does.
@@ -115,7 +84,7 @@ async function main() {
             () => log.push("p1:tool-rejected"),
           );
           await new Promise(() => {});
-        }, 300);
+        }, { settleMs: 300 });
       });
       const first = await post("stop-parked", {
         tools: [bashTool],

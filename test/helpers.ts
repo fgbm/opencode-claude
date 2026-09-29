@@ -82,4 +82,52 @@ export const bashTool = {
   },
 };
 
+export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Mock SDK turn: runs `body`, and on interrupt() yields what the CLI emits
+ * for an interrupted tool call (the rejection, the marker, an aborted_tools
+ * result) and ends, like the real CLI does.
+ */
+export function interruptibleTurn(
+  log: string[],
+  name: string,
+  body: () => AsyncGenerator<unknown>,
+  options: { settleMs?: number; sessionId?: string } = {},
+) {
+  const { settleMs = 0, sessionId } = options;
+  const session = sessionId ? { session_id: sessionId } : {};
+  let interrupted!: () => void;
+  const interruptSignal = new Promise<"interrupt">((r) => (interrupted = () => r("interrupt")));
+  const stream = (async function* () {
+    const inner = body();
+    while (true) {
+      const next = await Promise.race([inner.next(), interruptSignal]);
+      if (next === "interrupt") break;
+      if (next.done) return;
+      yield next.value;
+    }
+    if (settleMs > 0) await sleep(settleMs);
+    yield { type: "user", uuid: `${name}-reject`, parent_tool_use_id: null, message: { content: [] }, ...session };
+    yield { type: "user", uuid: `${name}-marker`, parent_tool_use_id: null, message: { content: [] }, ...session };
+    yield {
+      type: "result",
+      subtype: "error_during_execution",
+      is_error: true,
+      errors: ["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use"],
+      terminal_reason: "aborted_tools",
+      ...session,
+    };
+  })();
+  return {
+    stream,
+    interrupt: async () => {
+      log.push(`${name}:interrupt`);
+      interrupted();
+    },
+    close: () => log.push(`${name}:close`),
+    getPid: () => null,
+  };
+}
+
 export { assert };

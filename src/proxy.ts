@@ -1194,6 +1194,22 @@ async function startNewTurn(input: {
     forwardedSteering: new Set(),
     createdAt: Date.now(),
   };
+  // Session binding and resume point follow every event the turn yields,
+  // including the ones stop() reads after an interrupt: for a turn stopped
+  // while parked on a tool, those are the CLI's rejected tool_result and
+  // its "[Request interrupted by user for tool use]" entry, so the next turn
+  // resumes after the interruption instead of at the unanswered tool_use.
+  if (!isMetaRequest) {
+    handle.onEvent((event) => {
+      const sessionId = extractSessionId(event);
+      if (!sessionId) return;
+      setForeignSessionId(conversationKey, sessionId, {
+        modelId: model,
+        cwd,
+        leafUuid: mainChainUuid(event),
+      });
+    });
+  }
   putBridge(bridge);
   input.releaseSpawnLock();
 
@@ -1334,14 +1350,6 @@ async function startNewTurn(input: {
         if (raced.value.done) break;
         const event = raced.value.value;
         trackMessageState(event);
-        const sessionId = extractSessionId(event);
-        if (sessionId && !isMetaRequest) {
-          setForeignSessionId(conversationKey, sessionId, {
-            modelId: model,
-            cwd,
-            leafUuid: mainChainUuid(event),
-          });
-        }
         logTurnUsage(event, { conversationKey, metaKind, model: queryModel });
         const fallback = event as {
           type?: string;
