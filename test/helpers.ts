@@ -11,6 +11,8 @@ export async function startMockedProxy(label: string) {
   // Env must be set before the proxy modules load.
   const tmp = mkdtempSync(join(tmpdir(), `opencode-claude-${label}-`));
   process.env.XDG_DATA_HOME = tmp;
+  // Mocked turns ignore interrupt(); don't wait the real grace for them.
+  process.env.OPENCODE_CLAUDE_STOP_GRACE_MS ??= "50";
   process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE = join(tmp, "rate-limit.json");
   const { setAuthStatusProbe } = await import("../src/detect.ts");
   setAuthStatusProbe(() => ({ loggedIn: true, detail: "auth-status-oauth" }));

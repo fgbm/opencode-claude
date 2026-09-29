@@ -15,6 +15,8 @@ import {
   findBridgeByConversation,
   findBridgeByPendingTool,
   putBridge,
+  stopBridge,
+  stopConversationBridges,
   type ParkedBridge,
   type ParkedToolCall,
 } from "./bridge-pool.js";
@@ -36,7 +38,11 @@ import {
   SESSION_HEADER,
   type ClaudeEffort,
 } from "./constants.js";
-import { startClaudeQuery, type ClaudeQueryHandle } from "./query.js";
+import {
+  startClaudeQuery,
+  withGracefulStop,
+  type StoppableClaudeQueryHandle,
+} from "./query.js";
 import {
   clearForeignSessionId,
   conversationKeyFromMessages,
@@ -351,7 +357,7 @@ export function proxyHolderCount(): number {
 
 export async function stopProxy(): Promise<void> {
   // Parked turns each hold a live claude CLI child; nothing resumes them now.
-  clearAllBridges();
+  await clearAllBridges();
   if (server) {
     server.stop(true);
     server = null;
@@ -741,15 +747,89 @@ async function handleChatCompletions(
     }
   }
 
+  // Everything from here spawns a claude process. One chat spawns one at a
+  // time: a second request waits, then stops what the first one started.
+  const releaseSpawnLock = await acquireSpawnLock(conversationKey);
+  try {
+    return await startNewTurn({
+      req,
+      body,
+      messages,
+      sessionHeader,
+      metaKind,
+      conversationKey,
+      selection,
+      model,
+      stream,
+      toolResults,
+      releaseSpawnLock,
+    });
+  } finally {
+    releaseSpawnLock();
+  }
+}
+
+const spawnLocks = new Map<string, Promise<void>>();
+
+/**
+ * Serialize turn starts per conversation. Resolves with an idempotent
+ * release; the lock is held only until the new turn is in the bridge pool.
+ */
+async function acquireSpawnLock(key: string): Promise<() => void> {
+  const previous = spawnLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => (release = resolve));
+  const tail = previous.then(() => held);
+  spawnLocks.set(key, tail);
+  await previous;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    release();
+    if (spawnLocks.get(key) === tail) spawnLocks.delete(key);
+  };
+}
+
+async function startNewTurn(input: {
+  req: Request;
+  body: ChatCompletionRequest;
+  messages: OpenAIMessage[];
+  sessionHeader: string | null;
+  metaKind: MetaRequestKind;
+  conversationKey: string;
+  selection: { modelId: string; effort?: ClaudeEffort };
+  model: string;
+  stream: boolean;
+  toolResults: Map<string, McpToolResultContent[]>;
+  releaseSpawnLock: () => void;
+}): Promise<Response> {
+  const {
+    req,
+    body,
+    messages,
+    sessionHeader,
+    metaKind,
+    conversationKey,
+    selection,
+    model,
+    stream,
+    toolResults,
+  } = input;
   // A new turn while an earlier one of this chat still runs (OpenCode
-  // restarted, retried, or moved on): close the old one first. Two claude
-  // processes writing the same session file fork its history.
-  if (metaKind === null && existing && existing.conversationKey === conversationKey) {
-    log.warn("[opencode-claude] closing an earlier turn still running for this chat", {
+  // restarted, retried, or moved on): stop the old one first and wait for
+  // its process to close. Two claude processes writing the same session
+  // file fork its history.
+  const existing = findBridgeByConversation(conversationKey);
+  if (metaKind === null && existing) {
+    log.warn("[opencode-claude] stopping an earlier turn still running for this chat", {
       conversationKey,
     });
-    deleteBridge(existing.id);
-    existing = undefined;
+  }
+  // Also waits for a stop already running in the background (the session
+  // was interrupted a moment ago, the reaper fired).
+  if (metaKind === null) {
+    await stopConversationBridges(conversationKey, "Superseded by a newer turn");
   }
 
   log.info("[opencode-claude] chat completions", {
@@ -759,7 +839,7 @@ async function handleChatCompletions(
     toolCount: Array.isArray(body.tools) ? body.tools.length : 0,
     messageCount: messages.length,
     hasToolResults: toolResults.size > 0,
-    bridgePending: existing?.pendingTools.size ?? 0,
+    stoppedEarlierTurn: Boolean(metaKind === null && existing),
   });
 
   const env = buildClaudeCodeChildEnv();
@@ -771,7 +851,7 @@ async function handleChatCompletions(
     process.env.OPENCODE_CLAUDE_CWD || requestDirectory || process.cwd();
   const bridgeId = randomUUID();
   const pendingTools = new Map<string, ParkedToolCall>();
-  let handle: ClaudeQueryHandle | null = null;
+  let handle: StoppableClaudeQueryHandle | null = null;
   let parked = false;
   let parkWaiters: Array<() => void> = [];
   // The assistant message is still streaming: sibling tool calls may follow
@@ -1038,7 +1118,7 @@ async function handleChatCompletions(
   // Generation is an explicit model choice by the caller; keep it.
   const queryModel =
     metaKind === "title" || metaKind === "summary" ? META_REQUEST_MODEL : model;
-  handle = await queryStarter({
+  handle = withGracefulStop(await queryStarter({
     prompt: queryPrompt,
     cwd,
     // Titles and compaction summaries run as their own one-shot turn that
@@ -1103,7 +1183,7 @@ async function handleChatCompletions(
               : []),
           ].join("\n\n"),
         },
-  });
+  }));
 
   const bridge: ParkedBridge = {
     id: bridgeId,
@@ -1115,6 +1195,7 @@ async function handleChatCompletions(
     createdAt: Date.now(),
   };
   putBridge(bridge);
+  input.releaseSpawnLock();
 
   let reapTimer: ReturnType<typeof setTimeout> | null = null;
   const clearParkReap = () => {
@@ -1138,7 +1219,7 @@ async function handleChatCompletions(
           : "[opencode-claude] reaping parked turn past its TTL",
         { conversationKey, pending: pendingTools.size },
       );
-      deleteBridge(bridgeId);
+      void stopBridge(bridgeId);
     }, ms);
     reapTimer.unref?.();
   };
@@ -2100,7 +2181,7 @@ function streamOpenAIResponse(
       // the turn down instead of leaking the CLI process and the bridge.
       streamClosed = true;
       if (heartbeat) clearInterval(heartbeat);
-      deleteBridge(bridge.id);
+      void stopBridge(bridge.id);
     },
   });
 

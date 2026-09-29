@@ -10,6 +10,8 @@ async function main() {
   const { mkdtempSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
   process.env.XDG_DATA_HOME = mkdtempSync(`${tmpdir()}/opencode-claude-smoke-`);
+  // Mocked turns ignore interrupt(); don't wait the real grace for them.
+  process.env.OPENCODE_CLAUDE_STOP_GRACE_MS = "50";
   const { buildClaudeCodeChildEnv } = await import("../src/auth-env.ts");
   const {
     interpretClaudeAuthStatus,
@@ -1102,8 +1104,10 @@ async function main() {
     } as any);
     assert.equal(closeSessionBridges("ses_other"), 0);
     assert.equal(closeSessionBridges("ses_aborted"), 1);
-    assert.equal(closed, true);
+    // Leaves the pool at once; the process closes after the stop settles.
     assert.equal(getBridge("abort-test"), undefined);
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(closed, true);
   }
 
   // Evicting one OpenCode location must not stop the proxy another still uses
