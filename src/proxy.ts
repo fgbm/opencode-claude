@@ -1407,7 +1407,16 @@ async function startNewTurn(input: {
 }
 
 
-/** Transcript uuid of a main-chain (not subagent) assistant or user event. */
+/**
+ * Transcript uuid of a main-chain (not subagent) assistant or user event.
+ *
+ * Compaction needs nothing extra. The CLI emits the compact summary as a
+ * synthetic (not replayed) user event right after system/compact_boundary,
+ * and that summary is the entry to resume from. The boundary's own uuid is
+ * deliberately not a leaf: checked live, resumeSessionAt accepts it but
+ * resumes at the start of the compacted chain, before the summary, so
+ * Claude loses the whole conversation.
+ */
 function mainChainUuid(event: unknown): string | undefined {
   if (!event || typeof event !== "object") return undefined;
   const e = event as Record<string, unknown>;
