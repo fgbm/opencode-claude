@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.1 - 2026-09-30
+
+- **Fix: compaction loop**: when OpenCode compacted a chat while Claude was
+  waiting on a tool, the old turn kept answering the compacted chat with its
+  old context size, and OpenCode compacted again and again. Compaction now
+  stops that turn first, and the chat continues on the compacted history.
+
 ## 1.3.0 - 2026-09-30
 
 - **Claude no longer forgets part of a chat**: after an OpenCode restart, a
