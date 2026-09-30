@@ -661,8 +661,19 @@ async function handleChatCompletions(
   // OpenCode is compacting this chat. The Claude session it would resume
   // still holds the full uncompacted context, so drop the binding: the next
   // turn starts a fresh Claude session from the compacted history instead.
+  // A turn parked on a tool call belongs to that old session too. Left
+  // alive, it re-emits its call to the compacted chat together with the old
+  // context size, and OpenCode compacts again, in a loop. Stop it first, so
+  // its last events can't write the binding back either.
   if (metaKind === "summary") {
-    clearForeignSessionId(sessionHeader || conversationKeyFromMessages(messages));
+    const chatKey = sessionHeader || conversationKeyFromMessages(messages);
+    const stopped = await stopConversationBridges(chatKey, "Chat compacted");
+    if (stopped > 0) {
+      log.info("[opencode-claude] stopped the turn of a chat being compacted", {
+        conversationKey: chatKey,
+      });
+    }
+    clearForeignSessionId(chatKey);
   }
   const selection = selectionFromRequest(req, body);
   const model = resolveClaudeModelId(selection.modelId);
