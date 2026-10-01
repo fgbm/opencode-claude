@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.3.4 - 2026-10-01
+
+- **Skills work again**: Claude gets OpenCode's skills list (from `.claude`,
+  `.agents` and `.opencode`) and loads skills through OpenCode's skill tool.
+- **Custom agents keep their role**: a custom agent's own prompt, like a
+  `writer` subagent's rules, now reaches Claude as that session's role.
+  OpenCode's built-in agents still run on Claude Code's prompt alone.
+- **MCP server notes and OpenCode-only instructions**: what MCP servers say
+  about their tools, and instruction files only OpenCode reads (the global
+  `~/.config/opencode/AGENTS.md`, files in `instructions`) are passed on. A
+  project's `AGENTS.md` is left to Claude Code, which reads it where there
+  is no `CLAUDE.md`.
+- The runtime note no longer repeats the model and effort; Claude Code's
+  prompt already names the model.
+
 ## 1.3.3 - 2026-10-01
 
 - **Fix: Claude got more of OpenCode's system prompt than intended**: since
