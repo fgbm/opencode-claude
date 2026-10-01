@@ -10,6 +10,7 @@
  */
 import { createHash, randomUUID } from "node:crypto";
 import { currentHost, mcpToolName, openCodeToolName } from "./host.js";
+import { mcpInstructions, openCodeInstructionFiles } from "./opencode-context.js";
 import {
   clearAllBridges,
   deleteBridge,
@@ -100,6 +101,8 @@ import {
   detectMetaRequestKind,
   metaSystemPrompt,
   codeModeCatalog,
+  skillsCatalog,
+  customAgentPrompt,
   type MetaRequestKind,
   requestKeyNamespace,
 } from "./request-kind.js";
@@ -1260,6 +1263,10 @@ async function startNewTurn(input: {
       : promptAsStream(mainPrompt);
 
   const codeMode = openCodeToolNames.includes("execute") ? codeModeCatalog(messages) : "";
+  const skills = openCodeToolNames.includes("skill") ? skillsCatalog(messages) : "";
+  const agentPrompt = customAgentPrompt(messages);
+  const instructionFiles = isMetaRequest ? "" : openCodeInstructionFiles(messages, cwd);
+  const mcpNotes = openCodeToolNames.includes("execute") ? mcpInstructions(messages) : "";
   // Generation is an explicit model choice by the caller; keep it.
   const queryModel =
     metaKind === "title" || metaKind === "summary" ? META_REQUEST_MODEL : model;
@@ -1305,20 +1312,29 @@ async function startNewTurn(input: {
           type: "preset",
           preset: "claude_code",
           append: [
-            buildRuntimeInstructions({
-              modelName: getClaudeModels().find((m) => m.id === selection.modelId)?.name,
-              effort: selection.effort,
-            }),
+            buildRuntimeInstructions(),
+            ...(agentPrompt
+              ? [
+                  `# Agent role (from the agent configuration in ${currentHost().name}; it defines who you are in this session and takes precedence over the generic role above)\n\n${agentPrompt}`,
+                ]
+              : []),
             ...(bridgeOpenCodeTools
               ? [
                   [
-                    `Built-in Claude Code tools are disabled. Use only the ${mcpToolName("*")} tools provided for this turn; they execute via OpenCode.`,
+                    `Built-in Claude Code tools are disabled. Use only the ${mcpToolName("*")} tools provided for this turn; they execute via ${currentHost().name}.`,
                     "Batch independent tool calls into a single turn instead of calling them one at a time.",
                   ].join(" "),
                 ]
               : []),
             ...(bridgeOpenCodeTools && codeMode
               ? [`${codeMode}\n\nThe \`execute\` tool above is ${mcpToolName("execute")}.`]
+              : []),
+            ...(bridgeOpenCodeTools && mcpNotes ? [mcpNotes] : []),
+            ...(bridgeOpenCodeTools && skills
+              ? [`${skills}\n\nThe skill tool above is ${mcpToolName("skill")}.`]
+              : []),
+            ...(instructionFiles
+              ? [`# Project instructions (loaded by ${currentHost().name})\n\n${instructionFiles}`]
               : []),
           ].join("\n\n"),
         },

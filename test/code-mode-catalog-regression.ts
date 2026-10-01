@@ -4,7 +4,7 @@
  * Synthetic fixtures only; no Claude login, network requests, or private prompts.
  */
 import assert from "node:assert/strict";
-import { codeModeCatalog } from "../src/request-kind.ts";
+import { codeModeCatalog, customAgentPrompt, skillsCatalog } from "../src/request-kind.ts";
 
 const extract = (system: string) => codeModeCatalog([{ role: "system", content: system }]);
 const catalog = [
@@ -93,5 +93,37 @@ for (const system of [
 ]) {
   assert.equal(extract(system), "");
 }
+
+// The skills list lives only in the system prompt; Claude needs its ids
+// to use the skill tool, and nothing after the list comes along.
+const skillsBlock = [
+  "Skills provide specialized instructions and workflows for specific tasks.",
+  "Use the skill tool to load a skill when a task matches its description.",
+  "<available_skills>",
+  "  <skill>",
+  "    <id>demo</id>",
+  "    <name>demo</name>",
+  "    <description>Demo skill</description>",
+  "  </skill>",
+  "</available_skills>",
+].join("\n");
+const skillsOf = (system: string) => skillsCatalog([{ role: "system", content: system }]);
+assert.equal(skillsOf(`${catalog}\n\n${skillsBlock}\n\n${environment}`), skillsBlock);
+assert.equal(
+  skillsOf("Skills provide specialized instructions and workflows for specific tasks.\nNo skills are currently available.\n\nToday's date: x"),
+  "Skills provide specialized instructions and workflows for specific tasks.\nNo skills are currently available.",
+);
+assert.equal(skillsOf(environment), "");
+assert.equal(skillsCatalog([{ role: "user", content: skillsBlock }]), "");
+
+// A custom agent's own prompt sits before OpenCode's "# Your Model"; stock
+// prompts (build, plan, model-specific variants) are not forwarded.
+const identity = "# Your Model\n- Name: Opus 5.5\n- Provider ID: claude-code";
+const persona = "You hand-write text and data for the task you are given.\n\nNever use templates.";
+const agentOf = (system: string) => customAgentPrompt([{ role: "system", content: system }]);
+assert.equal(agentOf(`${persona}\n\n${identity}\n\n${catalog}`), persona);
+assert.equal(agentOf(`You are an AI agent running in OpenCode, a coding agent harness.\n\n# Harness\n- x\n\n${identity}`), "");
+assert.equal(agentOf(`You are OpenCode, an interactive general AI agent.\n\n${identity}`), "");
+assert.equal(agentOf(`${persona}\n\n${catalog}`), "", "no identity heading: layout unknown");
 
 console.log("code mode catalog regression ok");

@@ -961,15 +961,10 @@ export function withLeadingText(
 }
 
 /**
- * What t3code tells Claude about its host: stated plainly, once, in the
- * appended runtime note. The Claude Code system prompt itself is never
- * replaced or rewritten.
+ * What Claude is told about its host: stated plainly, once, in the appended
+ * runtime note. The Claude Code system prompt itself is never replaced or
+ * rewritten, and it already names the model.
  */
-export function buildRuntimeInstructions(runtime: {
-  modelName?: string;
-  effort?: string;
-}): string {
-  const model = runtime.modelName ? `, as ${runtime.modelName}` : "";
-  const effort = runtime.effort ? ` with ${runtime.effort} reasoning effort` : "";
-  return `<runtime_info>In case you're asked: you are running in ${currentHost().name} through the Claude Code harness${model}${effort}. No need to mention this otherwise.</runtime_info>`;
+export function buildRuntimeInstructions(): string {
+  return `<runtime_info>In case you're asked: you are running in ${currentHost().name} through the Claude Code harness. No need to mention this otherwise.</runtime_info>`;
 }
