@@ -45,6 +45,7 @@ import {
   type ClaudeEffort,
 } from "./constants.js";
 import {
+  forkClaudeSession,
   startClaudeQuery,
   withGracefulStop,
   type StoppableClaudeQueryHandle,
@@ -59,6 +60,8 @@ import {
   matchTurnHistory,
   recordTurnStart,
   rewindSessionTurns,
+  lastChainEntryUuid,
+  sessionChainAfterLeaf,
   sessionFileHasEntry,
   setForeignSessionId,
 } from "./session-store.js";
@@ -243,6 +246,15 @@ export function setClaudeQueryStarter(
   starter: typeof startClaudeQuery | null,
 ): void {
   queryStarter = starter ?? startClaudeQuery;
+}
+
+/** Injectable for tests — production path always uses forkClaudeSession. */
+let sessionForker: typeof forkClaudeSession = forkClaudeSession;
+
+export function setClaudeSessionForker(
+  forker: typeof forkClaudeSession | null,
+): void {
+  sessionForker = forker ?? forkClaudeSession;
 }
 
 export function getClaudeProxyBaseUrl(): string {
@@ -1043,24 +1055,43 @@ async function startNewTurn(input: {
   // is shorter than, or differs from, what the Claude session holds. Resume
   // from the boundary where the two still agree, or, when none does, start
   // over from the history OpenCode has.
+  // Where the resume has to be cut through a fork (see below): the session
+  // to copy and the entry to cut at.
+  let forkAt: { sessionId: string; leafUuid: string } | undefined;
   if (resume && sessionFile && !isMetaRequest) {
     const match = matchTurnHistory(
       getSessionTurns(conversationKey),
       userHistoryFingerprints(priorMessages),
     );
+    // A boundary may sit in an earlier session of this chat (before a
+    // fork); its file must still hold the leaf.
+    const source = match.kind === "rewind" ? (match.sessionId ?? resume) : undefined;
+    const sourceFile =
+      source === undefined ? null : source === resume ? sessionFile : findClaudeSessionFile(source);
     if (
       match.kind === "rewind" &&
       match.leafUuid &&
-      sessionFileHasEntry(sessionFile, match.leafUuid)
+      source &&
+      sourceFile &&
+      sessionFileHasEntry(sourceFile, match.leafUuid)
     ) {
       log.info("[opencode-claude] OpenCode history went back; resuming from an earlier turn", {
         conversationKey,
         turn: match.index,
+        session: source,
       });
       rewindSessionTurns(conversationKey, match.index);
+      // The undone turns descend from that leaf, so a plain resume would
+      // bring them back. Unless nothing came after it: a retry of a turn
+      // that failed before Claude wrote anything resumes as is.
+      const untouched =
+        source === resume &&
+        lastChainEntryUuid(sourceFile) === match.leafUuid &&
+        sessionChainAfterLeaf(sourceFile, match.leafUuid) === "clean";
+      if (!untouched) forkAt = { sessionId: source, leafUuid: match.leafUuid };
     } else if (match.kind === "rewind" && !match.leafUuid) {
       // A boundary recorded before this chat's leaf was known: nothing to
-      // pin to, so resume the whole session as before.
+      // cut at, so resume the whole session as before.
       log.info("[opencode-claude] OpenCode history went back to a turn with no resume point; resuming the session", {
         conversationKey,
         turn: match.index,
@@ -1074,6 +1105,56 @@ async function startNewTurn(input: {
       resume = undefined;
     }
   }
+  // Resume from the last entry this plugin saw. Another claude process
+  // writing the same session (a turn orphaned by an OpenCode restart) can
+  // leave a side branch after it, and a plain resume may follow that branch.
+  // The CLI's resumeSessionAt doesn't help there: it only searches the chain
+  // it picked and fails with "No message found". A fork cut at the leaf
+  // holds exactly our chain, so the resume goes through one when needed.
+  if (resume && sessionFile && !isMetaRequest && !forkAt) {
+    const leafUuid = getSessionLeafUuid(conversationKey);
+    if (leafUuid) {
+      const state = sessionChainAfterLeaf(sessionFile, leafUuid);
+      if (state === "branched") {
+        log.info("[opencode-claude] Claude session branched after this chat's last turn; resuming through a fork", {
+          conversationKey,
+        });
+        forkAt = { sessionId: resume, leafUuid };
+      } else if (state === "missing") {
+        log.info("[opencode-claude] last seen entry is not in the Claude session; resuming the session as is", {
+          conversationKey,
+        });
+      }
+    }
+  }
+  if (resume && forkAt) {
+    try {
+      const forked = await sessionForker(forkAt.sessionId, forkAt.leafUuid);
+      log.info("[opencode-claude] resuming a fork of the Claude session", {
+        conversationKey,
+        from: forkAt.sessionId,
+        fork: forked,
+      });
+      // Fork uuids are fresh. The current boundary moves to the fork's last
+      // entry, the copy of the leaf it was cut at; older boundaries keep
+      // pointing into the sessions they were recorded in.
+      const forkFile = findClaudeSessionFile(forked);
+      setForeignSessionId(conversationKey, forked, {
+        modelId: model,
+        cwd,
+        leafUuid: forkFile ? lastChainEntryUuid(forkFile) : undefined,
+      });
+      resume = forked;
+    } catch (error) {
+      log.warn("[opencode-claude] could not fork the Claude session; transferring history", {
+        conversationKey,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      clearForeignSessionId(conversationKey);
+      resume = undefined;
+    }
+  }
+
   if (!isMetaRequest) {
     const prints = userHistoryFingerprints(messages);
     const before = userHistoryFingerprints(priorMessages);
@@ -1085,14 +1166,6 @@ async function startNewTurn(input: {
       );
     }
   }
-
-  // Pin the resume to the last entry this plugin saw, so a branch written by
-  // another claude process on the same session can't replace the history.
-  const leafUuid = resume ? getSessionLeafUuid(conversationKey) : undefined;
-  const resumeSessionAt =
-    leafUuid && sessionFile && sessionFileHasEntry(sessionFile, leafUuid)
-      ? leafUuid
-      : undefined;
 
   // No resumable Claude session (first claude-code turn of this chat, model
   // switch mid-conversation, lost store): serialize the prior OpenCode
@@ -1198,7 +1271,6 @@ async function startNewTurn(input: {
     // of the model the user picked for the chat.
     model: queryModel,
     resume: isMetaRequest ? undefined : resume,
-    resumeSessionAt: isMetaRequest ? undefined : resumeSessionAt,
     effort: isMetaRequest ? undefined : selection.effort,
     env,
     mcpServers: isMetaRequest ? undefined : mcpServers,
@@ -1485,9 +1557,9 @@ async function startNewTurn(input: {
  * Compaction needs nothing extra. The CLI emits the compact summary as a
  * synthetic (not replayed) user event right after system/compact_boundary,
  * and that summary is the entry to resume from. The boundary's own uuid is
- * deliberately not a leaf: checked live, resumeSessionAt accepts it but
- * resumes at the start of the compacted chain, before the summary, so
- * Claude loses the whole conversation.
+ * deliberately not a leaf: checked live, a resume cut there starts the
+ * compacted chain before the summary, so Claude loses the whole
+ * conversation.
  */
 function mainChainUuid(event: unknown): string | undefined {
   if (!event || typeof event !== "object") return undefined;
@@ -2375,7 +2447,7 @@ function assistantErrorText(event: Record<string, unknown>): string | null {
 
 /** claude CLI text when `resume` points at a session it cannot load. */
 const LOST_SESSION_PATTERN =
-  /no conversation found|session\b.*\bnot found|could not (?:find|load|resume).*(?:session|conversation)/i;
+  /no conversation found|no message found with message\.uuid|session\b.*\bnot found|could not (?:find|load|resume).*(?:session|conversation)/i;
 
 /**
  * A resume-target-missing error means the stored foreign session id is dead.

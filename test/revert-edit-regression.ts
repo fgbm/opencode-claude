@@ -1,7 +1,9 @@
 /**
  * Regression: reverting or editing in OpenCode rewinds the Claude session
  * instead of resuming a history OpenCode no longer has.
- * - History back at an earlier turn → resumeSessionAt that turn's leaf.
+ * - History back at an earlier turn → a fork cut at that turn's leaf,
+ *   resumed plainly. Boundaries from before a fork are dropped; going back
+ *   to one transfers the history.
  * - History that matches no turn → binding dropped, history transferred.
  * - Normal flows never misfire: follow-ups, a retried request, a model
  *   switch, tool-result continuations, steering, a rebuilt tool step, Plan
@@ -9,7 +11,7 @@
  *
  * Run: bun test/revert-edit-regression.ts
  */
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { userHistoryFingerprints } from "../src/prompt.ts";
@@ -69,14 +71,34 @@ async function main() {
   process.env.CLAUDE_CONFIG_DIR = claudeConfig;
   const projectDir = join(claudeConfig, "projects", "proj");
   mkdirSync(projectDir, { recursive: true });
-  const sessionFile = join(projectDir, `${SESSION}.jsonl`);
-  const leaves: string[] = [];
-  const writeTranscript = () =>
-    writeFileSync(sessionFile, leaves.map((uuid) => JSON.stringify({ uuid })).join("\n") + "\n");
-  writeTranscript();
+  // Transcript entries per Claude session, each chained to the one before.
+  const files = new Map<string, string[]>();
+  const writeTranscript = (session: string) => {
+    const uuids = files.get(session) ?? [];
+    writeFileSync(
+      join(projectDir, `${session}.jsonl`),
+      uuids
+        .map((uuid, i) => JSON.stringify({ type: "assistant", uuid, parentUuid: i > 0 ? uuids[i - 1] : null }))
+        .join("\n") + "\n",
+    );
+  };
+  const append = (session: string, ...uuids: string[]) => {
+    files.set(session, [...(files.get(session) ?? []), ...uuids]);
+    writeTranscript(session);
+  };
 
   const { post, port, proxy } = await startMockedProxy("revert-edit");
   const { getForeignSessionId, getSessionTurns } = await import("../src/session-store.ts");
+
+  // Forks copy the chain up to the leaf with fresh uuids.
+  const forks: string[] = [];
+  proxy.setClaudeSessionForker(async (id, at) => {
+    const fork = `fork-${forks.length + 1}`;
+    forks.push(`${id}@${at}`);
+    const source = files.get(id) ?? [];
+    append(fork, ...source.slice(0, source.indexOf(at) + 1).map((uuid) => `${fork}-${uuid}`));
+    return fork;
+  });
 
   let spawns = 0;
   let seen: StartClaudeQueryParams | null = null;
@@ -85,72 +107,120 @@ async function main() {
     proxy.setClaudeQueryStarter(async (params) => {
       spawns += 1;
       seen = params;
-      leaves.push(leaf);
-      writeTranscript();
+      const session = params.resume ?? `fresh-${spawns}`;
+      append(session, leaf);
       return mockHandle(
         (async function* () {
-          yield { type: "system", subtype: "init", session_id: SESSION };
-          yield { type: "assistant", uuid: leaf, session_id: SESSION, parent_tool_use_id: null, message: { content: [] } };
+          yield { type: "system", subtype: "init", session_id: session };
+          yield { type: "assistant", uuid: leaf, session_id: session, parent_tool_use_id: null, message: { content: [] } };
           yield textDelta(`answer ${leaf}`);
-          yield { type: "result", is_error: false, usage: {}, session_id: SESSION };
+          yield { type: "result", is_error: false, usage: {}, session_id: session };
         })(),
       );
     });
   const turn = async (leaf: string, messages: unknown[], extra: Record<string, unknown> = {}) => {
     answering(leaf);
+    const forksBefore = forks.length;
     const res = await post("chat", { messages, ...extra });
     assert.equal(res.status, 200, `turn ${leaf}`);
     await res.text();
+    assert.equal("resumeSessionAt" in seen!, false);
     return {
       resume: seen!.resume,
-      at: seen!.resumeSessionAt,
+      fork: forks.length > forksBefore ? forks.at(-1) : undefined,
       transferred: /<conversation_history>/.test(await promptText(seen!.prompt)),
     };
   };
+  const leaves = () => getSessionTurns("chat").map((t) => t.leafUuid);
+  const where = () => getSessionTurns("chat").map((t) => `${t.sessionId}:${t.leafUuid}`);
 
   try {
-    // Three turns build the session.
+    // Three turns build the session; each resumes it as is.
     let r = await turn("L1", [user("u1")]);
     assert.equal(r.resume, undefined);
+    const first = getForeignSessionId("chat")!;
     r = await turn("L2", [user("u1"), assistant("a1"), user("u2")]);
-    assert.deepEqual(r, { resume: SESSION, at: "L1", transferred: false });
+    assert.deepEqual(r, { resume: first, fork: undefined, transferred: false });
     r = await turn("L3", [user("u1"), assistant("a1"), user("u2"), assistant("a2"), user("u3")]);
-    assert.deepEqual(r, { resume: SESSION, at: "L2", transferred: false });
-    assert.deepEqual(getSessionTurns("chat").map((t) => t.leafUuid), ["L1", "L2", "L3"]);
+    assert.deepEqual(r, { resume: first, fork: undefined, transferred: false });
+    assert.deepEqual(leaves(), ["L1", "L2", "L3"]);
 
-    // Revert of the last turn, new prompt → rewind to L2.
+    // Revert of the last turn, new prompt → a fork cut at L2. The undone
+    // turn descends from L2, so a plain resume would bring it back.
     r = await turn("L3b", [user("u1"), assistant("a1"), user("u2"), assistant("a2"), user("u3 edited")]);
-    assert.deepEqual(r, { resume: SESSION, at: "L2", transferred: false });
-    assert.deepEqual(getSessionTurns("chat").map((t) => t.leafUuid), ["L1", "L2", "L3b"]);
+    assert.deepEqual(r, { resume: "fork-1", fork: `${first}@L2`, transferred: false });
+    assert.equal(getForeignSessionId("chat"), "fork-1");
+    // The current boundary moves to the fork's copy of L2; the older one
+    // keeps pointing into the first session.
+    assert.deepEqual(where(), [`${first}:L1`, "fork-1:fork-1-L2", "fork-1:L3b"]);
 
-    // Normal follow-up after the rewind resumes the new branch.
+    // Normal follow-up after the rewind resumes the fork as is.
     const afterRewind = [user("u1"), assistant("a1"), user("u2"), assistant("a2"), user("u3 edited"), assistant("a3b")];
     r = await turn("L4", [...afterRewind, user("u4")]);
-    assert.deepEqual(r, { resume: SESSION, at: "L3b", transferred: false });
+    assert.deepEqual(r, { resume: "fork-1", fork: undefined, transferred: false });
 
-    // Edit of an earlier message: back two turns → rewind to L1.
-    r = await turn("L2b", [user("u1"), assistant("a1"), user("u2 edited")]);
-    assert.deepEqual(r, { resume: SESSION, at: "L1", transferred: false });
+    // Back one turn inside the fork → fork of the fork, cut at L3b.
+    r = await turn("L4b", [...afterRewind, user("u4 edited")]);
+    assert.deepEqual(r, { resume: "fork-2", fork: "fork-1@L3b", transferred: false });
+    assert.deepEqual(where(), [`${first}:L1`, "fork-1:fork-1-L2", "fork-2:fork-2-L3b", "fork-2:L4b"]);
 
-    // OpenCode retries the same request (the first attempt failed): the
-    // retry goes back to where that attempt started, not after its prompt.
-    r = await turn("L2c", [user("u1"), assistant("a1"), user("u2 edited")]);
-    assert.deepEqual(r, { resume: SESSION, at: "L1", transferred: false });
+    // Rewind across one fork: the boundary lives in fork-1, the chat in
+    // fork-2. The new fork comes from fork-1.
+    r = await turn("L3c", [user("u1"), assistant("a1"), user("u2"), assistant("a2"), user("u3 again")]);
+    assert.deepEqual(r, { resume: "fork-3", fork: "fork-1@fork-1-L2", transferred: false });
+    assert.deepEqual(where(), [`${first}:L1`, "fork-3:fork-3-fork-1-L2", "fork-3:L3c"]);
+
+    // Rewind across two forks (fork-1, fork-3): back to the first session.
+    r = await turn("L2d", [user("u1"), assistant("a1"), user("u2 again")]);
+    assert.deepEqual(r, { resume: "fork-4", fork: `${first}@L1`, transferred: false });
+    assert.deepEqual(where(), ["fork-4:fork-4-L1", "fork-4:L2d"]);
+
+    // A retry right after a fork whose turn failed before Claude wrote
+    // anything resumes that fork as is; nothing to cut.
+    const d = [user("u1"), assistant("a1"), user("u2 again"), assistant("a2d")];
+    r = await turn("L3d", [...d, user("u3")]);
+    assert.deepEqual(r, { resume: "fork-4", fork: undefined, transferred: false });
+    proxy.setClaudeQueryStarter(async (params) => {
+      spawns += 1;
+      seen = params;
+      return mockHandle(
+        (async function* () {
+          yield { type: "result", subtype: "error_during_execution", is_error: true, errors: ["API Error: 500 boom"] };
+        })(),
+      );
+    });
+    await (await post("chat", { messages: [...d, user("u3 x")] })).text();
+    assert.equal(seen!.resume, "fork-5");
+    assert.equal(forks.at(-1), "fork-4@L2d");
+    r = await turn("L3e", [...d, user("u3 x")]);
+    assert.deepEqual(r, { resume: "fork-5", fork: undefined, transferred: false });
+
+    // A rewind to a boundary whose session file is gone → history as text.
+    assert.equal(where()[0], "fork-4:fork-4-L1");
+    rmSync(join(projectDir, "fork-4.jsonl"));
+    r = await turn("L2z", [user("u1"), assistant("a1"), user("u2 z")]);
+    assert.deepEqual(r, { resume: undefined, fork: undefined, transferred: true });
+    const fresh = getForeignSessionId("chat")!;
 
     // A model switch changes nothing.
-    r = await turn("L3c", [user("u1"), assistant("a1"), user("u2 edited"), assistant("a2c"), user("u3")], {
-      model: "opus",
-    });
-    assert.deepEqual(r, { resume: SESSION, at: "L2c", transferred: false });
+    const base = [user("u1"), assistant("a1"), user("u2 z"), assistant("a2z")];
+    r = await turn("L3m", [...base, user("u3")], { model: "opus" });
+    assert.deepEqual(r, { resume: fresh, fork: undefined, transferred: false });
+
+    // OpenCode retries the same request (the first attempt answered but the
+    // response got lost): the retry goes back to where that attempt started.
+    r = await turn("L3n", [...base, user("u3")]);
+    assert.deepEqual(r, { resume: "fork-6", fork: `${fresh}@L2z`, transferred: false });
 
     // Plan mode reminder spliced before the prompt, stored after it later.
     const reminder = user("<system-reminder>\nYou are in Plan mode.\n</system-reminder>");
-    const base = [user("u1"), assistant("a1"), user("u2 edited"), assistant("a2c"), user("u3"), assistant("a3c")];
-    r = await turn("L4c", [...base, reminder, user("plan it")]);
-    assert.deepEqual(r, { resume: SESSION, at: "L3c", transferred: false });
-    r = await turn("L5c", [...base, user("plan it"), reminder, assistant("plan"), user("go")]);
-    assert.deepEqual(r, { resume: SESSION, at: "L4c", transferred: false });
-    const planned = [...base, user("plan it"), reminder, assistant("plan"), user("go"), assistant("done")];
+    const base2 = [...base, user("u3"), assistant("a3n")];
+    r = await turn("L5c", [...base2, reminder, user("plan it")]);
+    assert.deepEqual(r, { resume: "fork-6", fork: undefined, transferred: false });
+    r = await turn("L6c", [...base2, user("plan it"), reminder, assistant("plan"), user("go")]);
+    assert.deepEqual(r, { resume: "fork-6", fork: undefined, transferred: false });
+    const planned = [...base2, user("plan it"), reminder, assistant("plan"), user("go"), assistant("done")];
+    const session = getForeignSessionId("chat")!;
 
     // A title request leaves the boundaries alone.
     const before = JSON.stringify(getSessionTurns("chat"));
@@ -171,27 +241,27 @@ async function main() {
     proxy.setClaudeQueryStarter(async (params) => {
       spawns += 1;
       seen = params;
-      leaves.push("L6-tool");
-      writeTranscript();
+      append(session, "L7-tool");
       return mockHandle(
         (async function* () {
-          yield { type: "system", subtype: "init", session_id: SESSION };
-          yield { type: "assistant", uuid: "L6-tool", session_id: SESSION, parent_tool_use_id: null, message: { content: [] } };
+          yield { type: "system", subtype: "init", session_id: session };
+          yield { type: "assistant", uuid: "L7-tool", session_id: session, parent_tool_use_id: null, message: { content: [] } };
           await callTool(params, "bash", { command: "ls" });
-          yield { type: "user", uuid: "L6-result", session_id: SESSION, parent_tool_use_id: null, message: { content: [] } };
-          yield { type: "assistant", uuid: "L6", session_id: SESSION, parent_tool_use_id: null, message: { content: [] } };
+          yield { type: "user", uuid: "L7-result", session_id: session, parent_tool_use_id: null, message: { content: [] } };
+          yield { type: "assistant", uuid: "L7", session_id: session, parent_tool_use_id: null, message: { content: [] } };
           yield textDelta("listed");
-          yield { type: "result", is_error: false, usage: {}, session_id: SESSION };
+          yield { type: "result", is_error: false, usage: {}, session_id: session };
         })(),
       );
     });
     const askTool = [...planned, user("list files")];
+    const forksBeforeTool = forks.length;
     const parked = await post("chat", { tools: [bashTool], messages: askTool });
     const call = ((await parked.json()) as any).choices[0].message.tool_calls[0];
-    assert.equal(seen!.resumeSessionAt, "L5c");
+    assert.equal(seen!.resume, session);
+    assert.equal(forks.length, forksBeforeTool);
     const spawnsBefore = spawns;
-    leaves.push("L6-result", "L6");
-    writeTranscript();
+    append(session, "L7-result", "L7");
     const toolStep = [
       ...askTool,
       { role: "assistant", content: null, tool_calls: [call] },
@@ -202,9 +272,9 @@ async function main() {
     assert.equal(resumed.status, 200);
     await resumed.text();
     assert.equal(spawns, spawnsBefore, "continuation reuses the parked turn");
-    assert.equal(getSessionTurns("chat").at(-1)!.leafUuid, "L6");
-    r = await turn("L7", [...toolStep, assistant("2 files"), user("thanks")]);
-    assert.deepEqual(r, { resume: SESSION, at: "L6", transferred: false });
+    assert.equal(getSessionTurns("chat").at(-1)!.leafUuid, "L7");
+    r = await turn("L8", [...toolStep, assistant("2 files"), user("thanks")]);
+    assert.deepEqual(r, { resume: session, fork: undefined, transferred: false });
 
     // Tool results with no parked turn (reaped): rebuilt, still resumed.
     const orphanCall = { id: "call_orphan", type: "function", function: { name: "bash", arguments: "{}" } };
@@ -217,17 +287,18 @@ async function main() {
       { role: "assistant", content: null, tool_calls: [orphanCall] },
       { role: "tool", tool_call_id: "call_orphan", content: "late" },
     ];
-    r = await turn("L8", rebuiltHistory, { tools: [bashTool] });
-    assert.deepEqual(r, { resume: SESSION, at: "L7", transferred: false });
+    r = await turn("L9", rebuiltHistory, { tools: [bashTool] });
+    assert.deepEqual(r, { resume: session, fork: undefined, transferred: false });
 
     // A history that matches no turn: an early message changed.
     r = await turn("N1", [user("something else entirely"), assistant("a1"), user("u2")]);
     assert.equal(r.resume, undefined);
     assert.equal(r.transferred, true);
-    assert.equal(getForeignSessionId("chat"), SESSION, "the new turn binds again");
-    assert.deepEqual(getSessionTurns("chat").map((t) => t.leafUuid), ["N1"]);
+    assert.ok(getForeignSessionId("chat"), "the new turn binds again");
+    assert.deepEqual(leaves(), ["N1"]);
   } finally {
     proxy.setClaudeQueryStarter(null);
+    proxy.setClaudeSessionForker(null);
     await proxy.stopProxy();
   }
   console.log("ok — revert/edit regression passed");

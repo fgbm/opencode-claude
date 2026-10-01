@@ -31,6 +31,11 @@ async function main() {
   try {
     setForeignSessionId("moved-chat", SESSION, { cwd: oldCwd, leafUuid: "leaf-1" });
     let seen: Record<string, unknown> = {};
+    const forks: string[] = [];
+    proxy.setClaudeSessionForker(async (id, at) => {
+      forks.push(`${id}@${at}`);
+      return "unexpected-fork";
+    });
     proxy.setClaudeQueryStarter(async (params) => {
       seen = params as unknown as Record<string, unknown>;
       return mockHandle(
@@ -61,10 +66,12 @@ async function main() {
     await res.text();
     assert.equal(seen.cwd, newCwd);
     assert.equal(seen.resume, SESSION);
-    assert.equal(seen.resumeSessionAt, "leaf-1");
+    assert.equal("resumeSessionAt" in seen, false);
+    assert.deepEqual(forks, []);
     assert.doesNotMatch(String(seen.prompt), /<conversation_history>/);
   } finally {
     proxy.setClaudeQueryStarter(null);
+    proxy.setClaudeSessionForker(null);
     await proxy.stopProxy();
   }
   console.log("ok — cwd resume regression passed");

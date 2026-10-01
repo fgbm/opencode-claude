@@ -1866,12 +1866,19 @@ async function main() {
         String(seen2.params!.prompt ?? ""),
         /<conversation_history>/,
       );
-      assert.equal(seen2.params!.resumeSessionAt, undefined);
+      assert.equal("resumeSessionAt" in seen2.params!, false);
 
-      // 2b. The turn's main-chain entries become the resume point. A later
-      //     resume pins to it, so a branch another claude process appended
-      //     to the same file (an orphaned turn closed by the TTL reaper)
-      //     can't replace the history. Subagent entries don't move it.
+      // 2b. The turn's main-chain entries become the resume point. When
+      //     another claude process appended a branch after it (an orphaned
+      //     turn closed by the TTL reaper), the resume goes through a fork
+      //     cut at it. Subagent entries don't move it.
+      const { setClaudeSessionForker } = await import("../src/proxy.ts");
+      const forks: string[] = [];
+      setClaudeSessionForker(async (id, at) => {
+        forks.push(`${id}@${at}`);
+        writeFileSync(joinPath(fakeProjectsDir, "mock-sess-fork.jsonl"), '{"type":"assistant","uuid":"f1"}\n');
+        return "mock-sess-fork";
+      });
       setClaudeQueryStarter(async (params) => {
         seen2.params = params as unknown as Record<string, unknown>;
         return {
@@ -1909,18 +1916,44 @@ async function main() {
       assert.equal(getSessionLeafUuid("smoke-history-resume"), "leaf-main");
       writeFileSync(
         joinPath(fakeProjectsDir, "mock-sess-live.jsonl"),
-        '{"uuid":"leaf-main"}\n{"parentUuid":"old-point","uuid":"stale-branch"}\n',
+        '{"type":"assistant","uuid":"leaf-main"}\n{"type":"user","parentUuid":"leaf-main","uuid":"ours"}\n',
       );
       mockTurn(seen2, "mock-sess-live");
       await (await postChat("smoke-history-resume", historyMessages)).text();
       assert.equal(seen2.params!.resume, "mock-sess-live");
-      assert.equal(seen2.params!.resumeSessionAt, "leaf-main");
+      assert.deepEqual(forks, [], "a chain that continues from the leaf resumes as is");
+      writeFileSync(
+        joinPath(fakeProjectsDir, "mock-sess-live.jsonl"),
+        '{"type":"assistant","uuid":"leaf-main"}\n{"type":"user","parentUuid":"old-point","uuid":"stale-branch"}\n',
+      );
+      mockTurn(seen2, "mock-sess-fork");
+      await (await postChat("smoke-history-resume", historyMessages)).text();
+      assert.deepEqual(forks, ["mock-sess-live@leaf-main"]);
+      assert.equal(seen2.params!.resume, "mock-sess-fork");
+      assert.equal(getForeignSessionId("smoke-history-resume"), "mock-sess-fork");
+      assert.equal(getSessionLeafUuid("smoke-history-resume"), "f1");
       // A leaf the file no longer holds falls back to a plain resume.
       writeFileSync(joinPath(fakeProjectsDir, "mock-sess-live.jsonl"), "{}\n");
+      setForeignSessionId("smoke-history-noleaf", "mock-sess-live", { leafUuid: "gone" });
       mockTurn(seen2, "mock-sess-live");
-      await (await postChat("smoke-history-resume", historyMessages)).text();
+      await (await postChat("smoke-history-noleaf", historyMessages)).text();
       assert.equal(seen2.params!.resume, "mock-sess-live");
-      assert.equal(seen2.params!.resumeSessionAt, undefined);
+      assert.equal(forks.length, 1);
+      // A fork that fails transfers the history instead of retrying.
+      writeFileSync(
+        joinPath(fakeProjectsDir, "mock-sess-live.jsonl"),
+        '{"type":"assistant","uuid":"leaf-main"}\n{"type":"user","parentUuid":"old-point","uuid":"stale-branch"}\n',
+      );
+      setForeignSessionId("smoke-history-forkfail", "mock-sess-live", { leafUuid: "leaf-main" });
+      setClaudeSessionForker(async () => {
+        throw new Error("fork failed");
+      });
+      mockTurn(seen2, null);
+      await (await postChat("smoke-history-forkfail", historyMessages)).text();
+      assert.equal(seen2.params!.resume, undefined);
+      assert.match(String(seen2.params!.prompt ?? ""), /<conversation_history>/);
+      assert.equal(getForeignSessionId("smoke-history-forkfail"), undefined);
+      setClaudeSessionForker(null);
       rmSync(fakeProjectsDir, { recursive: true, force: true });
 
       // 3. Stored binding with a MISSING transcript file → binding dropped,

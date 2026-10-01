@@ -5,9 +5,10 @@
  * Checked live (CLI 2.1.284, manual /compact): the CLI emits
  * system/compact_boundary, then the summary as a user event with
  * isSynthetic (not isReplay), then a replayed "Compacted" stdout entry.
- * resumeSessionAt accepts the boundary uuid, but resuming there starts the
- * compacted chain without its summary and Claude remembered nothing. The
- * summary entry is the right resume point.
+ * Cutting the chain at the boundary uuid starts the compacted chain
+ * without its summary and Claude remembered nothing. The summary entry is
+ * the right leaf; the transcript after it descends from it, so the next
+ * turn is a plain resume.
  *
  * Run: bun test/compact-leaf-regression.ts
  */
@@ -32,6 +33,11 @@ async function main() {
   const { getSessionLeafUuid } = await import("../src/session-store.ts");
   try {
     let seen: Record<string, unknown> = {};
+    const forks: string[] = [];
+    proxy.setClaudeSessionForker(async (id, at) => {
+      forks.push(`${id}@${at}`);
+      return "unexpected-fork";
+    });
     proxy.setClaudeQueryStarter(async (params) => {
       seen = params as unknown as Record<string, unknown>;
       return mockHandle(
@@ -59,9 +65,11 @@ async function main() {
     });
     await next.text();
     assert.equal(seen.resume, SESSION);
-    assert.equal(seen.resumeSessionAt, "summary");
+    assert.equal("resumeSessionAt" in seen, false);
+    assert.deepEqual(forks, []);
   } finally {
     proxy.setClaudeQueryStarter(null);
+    proxy.setClaudeSessionForker(null);
     await proxy.stopProxy();
   }
   console.log("ok — compact leaf regression passed");

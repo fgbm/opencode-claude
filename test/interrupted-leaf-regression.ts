@@ -4,10 +4,10 @@
  *
  * Checked live (CLI 2.1.224 and 2.1.284): interrupting a parked MCP call
  * makes the CLI append a rejected tool_result and "[Request interrupted by
- * user for tool use]" and emit both as user events. Resuming with
- * resumeSessionAt on the dangling tool_use itself also works (the CLI pairs
- * it before calling the API), so this only keeps the resumed history
- * faithful: Claude sees that the call was interrupted.
+ * user for tool use]" and emit both as user events. The leaf follows them,
+ * so the resumed history stays faithful: Claude sees that the call was
+ * interrupted. Everything after the old leaf descends from it, so the
+ * resume stays a plain one, no fork.
  *
  * Run: bun test/interrupted-leaf-regression.ts
  */
@@ -42,6 +42,11 @@ async function main() {
   const { closeSessionBridges } = await import("../src/bridge-pool.ts");
   try {
     const log: string[] = [];
+    const forks: string[] = [];
+    proxy.setClaudeSessionForker(async (id, at) => {
+      forks.push(`${id}@${at}`);
+      return "unexpected-fork";
+    });
     let seen: Record<string, unknown> = {};
     proxy.setClaudeQueryStarter(async (params) => {
       seen = params as unknown as Record<string, unknown>;
@@ -96,9 +101,11 @@ async function main() {
     assert.equal(next.status, 200);
     await next.text();
     assert.equal(seen.resume, SESSION);
-    assert.equal(seen.resumeSessionAt, "t1-marker");
+    assert.equal("resumeSessionAt" in seen, false);
+    assert.deepEqual(forks, []);
   } finally {
     proxy.setClaudeQueryStarter(null);
+    proxy.setClaudeSessionForker(null);
     await proxy.stopProxy();
     clearInterval(keepAlive);
   }
