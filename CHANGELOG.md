@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.3 - 2026-10-01
+
+- **Fix: Claude got more of OpenCode's system prompt than intended**: since
+  OpenCode 2.0.19 the Code Mode tool catalog comes first in its system
+  prompt, and the plugin forwarded everything after it too (MCP guidance,
+  skills, date, environment, project instructions). Now only the tool
+  catalog reaches Claude. Thanks to @langfeld.
+
 ## 1.3.2 - 2026-10-01
 
 - **Fix: "No message found with message.uuid" on every message**: when a
