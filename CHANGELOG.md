@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.3.2 - 2026-10-01
+
+- **Fix: "No message found with message.uuid" on every message**: when a
+  Claude session had a side branch, resuming it from the chat's last turn
+  failed and the chat got stuck in retries. The plugin now resumes such
+  sessions, and reverted chats, through a fork of the session cut at the
+  right turn. Stuck chats recover on their next message.
+- **Deep reverts keep the session**: reverting past earlier forks resumes
+  from the session that holds that turn instead of resending the history
+  as text.
+
 ## 1.3.1 - 2026-09-30
 
 - **Fix: compaction loop**: when OpenCode compacted a chat while Claude was
