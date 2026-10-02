@@ -604,9 +604,18 @@ async function main() {
       { session, stream: false },
     );
     assert.match(first.text, /STORED_OK/);
+    // OpenCode sends the whole chat every turn, and the plugin compares it
+    // with what the Claude session already holds: a request carrying only the
+    // new message reads as an edit of the first one, and starts over.
     const second = await chat(
       {
         messages: [
+          {
+            role: "user",
+            content:
+              "For this coding session, the repository codename is NIGHTJAR. Reply with exactly STORED_OK.",
+          },
+          { role: "assistant", content: first.text },
           {
             role: "user",
             content:
