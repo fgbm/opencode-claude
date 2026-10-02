@@ -62,6 +62,21 @@ export async function loadClaudeAgentSdk(): Promise<SdkModule> {
   return sdkModulePromise;
 }
 
+/**
+ * Copy a Claude session's chain up to `upToMessageId` into a new session
+ * (fresh uuids, no side branches) and return the new id. A plain resume of
+ * the copy sees exactly that history, wherever other branches went.
+ */
+export async function forkClaudeSession(
+  sessionId: string,
+  upToMessageId: string,
+): Promise<string> {
+  const sdk = await loadClaudeAgentSdk();
+  const result = await sdk.forkSession(sessionId, { upToMessageId });
+  if (!result?.sessionId) throw new Error("forkSession returned no session id");
+  return result.sessionId;
+}
+
 export function resetClaudeAgentSdkCache(): void {
   sdkModule = null;
   sdkModulePromise = null;
@@ -124,7 +139,135 @@ export type ClaudeQueryHandle = {
   interrupt: () => Promise<void>;
   close: () => void;
   getPid: () => number | null | undefined;
+  /**
+   * Stop the turn the way Claude Code's own Esc does: interrupt, let the CLI
+   * write the interruption to the transcript, then close. Resolves once the
+   * process is closed. Added by withGracefulStop when missing.
+   */
+  stop?: (graceMs?: number) => Promise<void>;
+  /** Observe every event the stream yields, including ones read by stop(). */
+  onEvent?: (listener: (event: unknown) => void) => void;
 };
+
+export type StoppableClaudeQueryHandle = ClaudeQueryHandle & {
+  stop: (graceMs?: number) => Promise<void>;
+  onEvent: (listener: (event: unknown) => void) => void;
+};
+
+/** How long a stopped turn gets to settle after interrupt() before close. */
+export function stopGraceMs(): number {
+  const raw = Number(process.env.OPENCODE_CLAUDE_STOP_GRACE_MS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 2_000;
+}
+
+/**
+ * Give a query handle a graceful stop().
+ *
+ * close() kills the CLI at once: a turn parked on a tool call dies with its
+ * tool_use unanswered, and a turn killed before its first write leaves a
+ * session id the CLI never saved. stop() first sends the SDK interrupt, so
+ * the CLI aborts the turn itself and records it ("[Request interrupted by
+ * user for tool use]"), reads the stream until the turn's result (nobody
+ * else reads a parked turn), and closes after that or after the grace.
+ *
+ * The stream is wrapped once; its iterator is shared, so events read by
+ * stop() and by the proxy's consumer all pass the onEvent listeners.
+ */
+export function withGracefulStop(handle: ClaudeQueryHandle): StoppableClaudeQueryHandle {
+  if (typeof handle.stop === "function" && typeof handle.onEvent === "function") {
+    return handle as StoppableClaudeQueryHandle;
+  }
+  const inner = handle.stream[Symbol.asyncIterator]();
+  const listeners: Array<(event: unknown) => void> = [];
+  let ended = false;
+  let sawResult = false;
+  const observe = (event: unknown) => {
+    if (event && typeof event === "object" && (event as { type?: unknown }).type === "result") {
+      sawResult = true;
+    }
+    for (const listener of listeners) {
+      try {
+        listener(event);
+      } catch {
+        // a listener must never break the stream
+      }
+    }
+  };
+  const tap: AsyncIterableIterator<unknown> = {
+    async next() {
+      try {
+        const next = await inner.next();
+        if (next.done) ended = true;
+        else observe(next.value);
+        return next;
+      } catch (error) {
+        ended = true;
+        throw error;
+      }
+    },
+    async return(value?: unknown) {
+      ended = true;
+      if (typeof inner.return === "function") return inner.return(value);
+      return { done: true, value: undefined };
+    },
+    [Symbol.asyncIterator]() {
+      return tap;
+    },
+  };
+
+  let closed = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    handle.close();
+  };
+
+  let stopping: Promise<void> | null = null;
+  const stop = (graceMs = stopGraceMs()) => {
+    if (stopping) return stopping;
+    stopping = (async () => {
+      if (!closed && !ended && graceMs > 0) {
+        const settle = (async () => {
+          try {
+            await handle.interrupt();
+          } catch {
+            // process already gone; nothing to settle
+            return;
+          }
+          while (!ended && !sawResult && !closed) {
+            try {
+              if ((await tap.next()).done) break;
+            } catch {
+              break;
+            }
+          }
+        })();
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([
+          settle,
+          new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, graceMs);
+            timer.unref?.();
+          }),
+        ]);
+        if (timer) clearTimeout(timer);
+      }
+      close();
+    })();
+    return stopping;
+  };
+
+  return {
+    stream: tap,
+    interrupt: handle.interrupt,
+    close,
+    getPid: handle.getPid,
+    stop,
+    onEvent: (listener) => {
+      listeners.push(listener);
+    },
+  };
+}
 
 export type StartClaudeQueryParams = {
   prompt: string | AsyncIterable<unknown>;
@@ -386,15 +529,12 @@ export async function startClaudeQuery(
       ? (result.pid as number | null | undefined)
       : null;
 
+  // Query.interrupt() is a control request: it rejects once the process is
+  // gone, which callers treat as "nothing left to interrupt".
   const interrupt = async () => {
     if (result && typeof result.interrupt === "function") {
-      try {
-        await result.interrupt();
-      } catch {
-        // fall through to tree-kill
-      }
+      await result.interrupt();
     }
-    killProcessTree(getPid(), { signal: "SIGTERM" });
   };
 
   const close = () => {
@@ -421,7 +561,12 @@ export async function startClaudeQuery(
     abortController.abort();
   };
 
-  return { stream: result as AsyncIterable<unknown>, interrupt, close, getPid };
+  return withGracefulStop({
+    stream: result as AsyncIterable<unknown>,
+    interrupt,
+    close,
+    getPid,
+  });
 }
 
 /**

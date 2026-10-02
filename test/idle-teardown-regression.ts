@@ -45,6 +45,9 @@ async function main() {
     // Another location's module copy routes to the pool that owns the park.
     const sibling = await import("../src/proxy.ts?location=b");
     assert.deepEqual(sibling.teardownSessionBridges("idle-aborted"), ["idle-aborted"]);
+    // The stop is graceful: the turn leaves the pool at once, and its process
+    // closes after the interrupt settles (grace is 50ms in tests).
+    await new Promise((r) => setTimeout(r, 200));
     assert.equal(aborted.closed(), true, "idle closes the parked turn");
     assert.equal(other.closed(), false, "other sessions keep their park");
     assert.deepEqual(proxy.teardownSessionBridges("idle-aborted"), [], "idempotent");

@@ -1,5 +1,74 @@
 # Changelog
 
+## 1.3.4 - 2026-10-01
+
+- **Skills work again**: Claude gets OpenCode's skills list (from `.claude`,
+  `.agents` and `.opencode`) and loads skills through OpenCode's skill tool.
+- **Custom agents keep their role**: a custom agent's own prompt, like a
+  `writer` subagent's rules, now reaches Claude as that session's role.
+  OpenCode's built-in agents still run on Claude Code's prompt alone.
+- **MCP server notes and OpenCode-only instructions**: what MCP servers say
+  about their tools, and instruction files only OpenCode reads (the global
+  `~/.config/opencode/AGENTS.md`, files in `instructions`) are passed on. A
+  project's `AGENTS.md` is left to Claude Code, which reads it where there
+  is no `CLAUDE.md`.
+- The runtime note no longer repeats the model and effort; Claude Code's
+  prompt already names the model.
+
+## 1.3.3 - 2026-10-01
+
+- **Fix: Claude got more of OpenCode's system prompt than intended**: since
+  OpenCode 2.0.19 the Code Mode tool catalog comes first in its system
+  prompt, and the plugin forwarded everything after it too (MCP guidance,
+  skills, date, environment, project instructions). Now only the tool
+  catalog reaches Claude. Thanks to @langfeld.
+
+## 1.3.2 - 2026-10-01
+
+- **Fix: "No message found with message.uuid" on every message**: when a
+  Claude session had a side branch, resuming it from the chat's last turn
+  failed and the chat got stuck in retries. The plugin now resumes such
+  sessions, and reverted chats, through a fork of the session cut at the
+  right turn. Stuck chats recover on their next message.
+- **Deep reverts keep the session**: reverting past earlier forks resumes
+  from the session that holds that turn instead of resending the history
+  as text.
+
+## 1.3.1 - 2026-09-30
+
+- **Fix: compaction loop**: when OpenCode compacted a chat while Claude was
+  waiting on a tool, the old turn kept answering the compacted chat with its
+  old context size, and OpenCode compacted again and again. Compaction now
+  stops that turn first, and the chat continues on the compacted history.
+
+## 1.3.0 - 2026-09-30
+
+- **Claude no longer forgets part of a chat**: after an OpenCode restart, a
+  leftover `claude` process could write into the same Claude session and
+  fork it, and the next message resumed the wrong branch. The plugin now
+  remembers where its conversation ends and resumes exactly there, stops an
+  earlier turn properly before starting the next one, and never runs two
+  processes on one session.
+- **Revert and edit reach Claude**: after reverting or editing a message in
+  OpenCode, Claude continues from that point instead of remembering the
+  undone turns. If an old message changed, the history is sent as text.
+- **Real error messages**: failed turns show Claude Code's actual reason
+  instead of "Claude turn failed". A chat that outgrew the context window
+  makes OpenCode compact instead of retrying the same request, image errors
+  aren't retried, and refusals say why.
+- **Truncated answers look truncated**: a reply cut at the token limit ends
+  as `length`, a refusal as `content_filter`, not as a normal finish.
+- **Overload and retries are visible**: Claude Code's retries show up in
+  the reasoning, long retry pauses no longer kill the turn, and an overload
+  reported as an empty success becomes a 503 that OpenCode retries.
+- **Extra usage errors aren't retried**: when Anthropic answers "Third-party
+  apps now draw from extra usage", you see it once instead of a retry loop.
+- **Tools named after the app**: under OpenChamber the tools are
+  `mcp__openchamber__*` and Claude is told it runs in OpenChamber; in plain
+  OpenCode both say OpenCode.
+- Removed the leftover todo tool aliases and plan prompt from OpenCode 1.x,
+  and the session store is written only when something changes.
+
 ## 1.2.3 - 2026-09-27
 
 - **Fix: Claude didn't know about MCP and OpenChamber tools**: OpenCode 2.x

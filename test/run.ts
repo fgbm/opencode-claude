@@ -22,6 +22,9 @@ for (const file of files) {
   const proc = Bun.spawn([process.execPath, join(dir, file)], {
     stdout: "pipe",
     stderr: "pipe",
+    // Suites run as plain OpenCode, whatever terminal started them;
+    // host-regression covers OpenChamber.
+    env: { ...process.env, OPENCHAMBER_RUNTIME: "" },
   });
   const [stdout, stderr, code] = await Promise.all([
     new Response(proc.stdout).text(),

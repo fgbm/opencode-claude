@@ -19,7 +19,7 @@ The plugin is built to stay inside those rules:
 
 - **Claude Code does all the talking to Anthropic.** The plugin calls the Agent SDK, the SDK runs your local `claude` CLI, and the CLI sends the requests. The plugin makes no calls to Anthropic itself.
 - **Your login stays with Claude Code.** Sign-in is `claude auth login`, run by the CLI. The plugin never reads, copies, stores or sends tokens.
-- **No disguise.** Claude is told plainly that it runs in OpenChamber through the Claude Code harness. The plugin doesn't fake headers, rewrite Claude Code's system prompt, or hide that it's a third-party app.
+- **No disguise.** Claude is told plainly that it runs in OpenChamber (or OpenCode, when OpenChamber didn't start it) through the Claude Code harness, and its tools are named after that app. The plugin doesn't fake headers, rewrite Claude Code's system prompt, or hide that it's a third-party app.
 - **One person, one machine.** The proxy the plugin starts listens on `127.0.0.1` only and refuses requests from web pages. Don't expose it or share your plan with other people.
 - **Limits are respected.** When your plan hits a limit, you see the real error and the reset time. The plugin doesn't retry into a limit or route around it.
 - **Plans only.** If `claude` is signed in with a Console API key, or set up for Bedrock or Vertex, the plugin refuses. For API keys, use OpenCode's built-in Anthropic provider instead.
@@ -85,6 +85,10 @@ You need [OpenCode](https://opencode.ai) 2.x and the [Claude Code CLI](https://w
 
 **Plan mode.** OpenCode's Plan agent works as usual: Claude is told it's in plan mode, and OpenCode blocks file edits.
 
+**Project instructions.** Claude Code reads `CLAUDE.md` itself, and a project's `AGENTS.md` where there is no `CLAUDE.md` (its `instructionFiles` setting). OpenCode-only instruction files, like `~/.config/opencode/AGENTS.md` or files in `instructions`, are passed on unless Claude Code already reads the same text.
+
+**Skills and agents.** OpenCode's skills (from `.claude`, `.agents` and `.opencode`) are listed for Claude and load through OpenCode's skill tool. A custom agent's own prompt, like a `writer` subagent's, is passed on as that agent's role.
+
 **Titles and summaries.** Session titles and compaction summaries run as small one-off requests on Haiku, so they barely touch your limits.
 
 **Model fallback.** If Claude Code declines a request on one model and retries on another (for example Fable to Opus), you'll see a note in the reasoning, and the session switches to the model that's actually answering.
@@ -130,6 +134,11 @@ Most people won't need these. Set them in the environment of the OpenCode server
 | `OPENCODE_CLAUDE_TURN_STALL_MS` | End a turn when Claude Code goes silent this long (default 10 minutes) |
 | `OPENCODE_CLAUDE_PARKED_TURN_TTL_MS` | Close a turn waiting on tool results after this long (default 1 hour, `0` never) |
 | `OPENCODE_CLAUDE_RATE_LIMIT_FAST_FAIL=0` | Always send turns to Claude, even when a limit is known to be active |
+| `OPENCODE_CLAUDE_USAGE_LOG=0` | Stop writing `~/.local/share/opencode-claude/usage.jsonl`, one line per response with input / cache_read / cache_write / output tokens, a 5m/1h cache-write split, an estimated `turn_cost_usd`, and the sizes of the request sections that produced it |
+| `OPENCODE_CLAUDE_SPILL_CHARS` | Tool results longer than this are cut to a head and tail with a note on how much was dropped (default 8000, `0` turns it off). A `read` is never cut on the turn it runs |
+| `OPENCODE_CLAUDE_OUTPUT_STORE_MB` | Memory kept for cut outputs so Claude can read the rest through the local `output_slice` tool (default 16, `0` turns it off) |
+| `OPENCODE_CLAUDE_DYNAMIC_SECTIONS=keep` | Put cwd, memory path and git status back in the cached system prompt; by default they are moved out of the cached prefix |
+| `OPENCODE_CLAUDE_DEFER_TOOLS=1` | Leave `webfetch`, `websearch` and `subagent` out of the static tool list; Claude's tool search can still load them |
 
 ## Development
 

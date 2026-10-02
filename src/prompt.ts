@@ -2,12 +2,15 @@
  * Build Claude Agent SDK prompts from OpenAI-compatible chat messages,
  * including text, images, and PDF/document attachments.
  */
+import { createHash } from "node:crypto";
+import { currentHost } from "./host.js";
 import {
   isFileReadTool,
   presentHistoricalRead,
   presentLargeOutput,
   spillThreshold,
 } from "./spill.js";
+
 export type AnthropicContentBlock =
   | { type: "text"; text: string }
   | {
@@ -393,6 +396,39 @@ export function extractTextContent(content: unknown): string {
     })
     .filter(Boolean)
     .join("\n");
+}
+
+const SYSTEM_REMINDER_BLOCK = /<system-reminder>[\s\S]*?<\/system-reminder>/g;
+
+/**
+ * One short hash per user message of a conversation, in order: the
+ * conversation's shape as far as revert/edit detection needs it.
+ *
+ * Only user messages count. OpenCode may re-serialize assistant output
+ * (steps split per tool call, reasoning dropped), but a user message is
+ * sent the same way every time. Two kinds are skipped, because they are
+ * not stable across requests: OpenCode's promoted tool media, and
+ * <system-reminder> messages. Plan mode splices its reminder in before the
+ * user's prompt when sending, but stores it after, so its position moves
+ * between requests. Reminder blocks inside other messages are dropped too.
+ * Attachments count by presence only; their encoding may change.
+ */
+export function userHistoryFingerprints(
+  messages: Array<{ role?: string; content?: unknown }>,
+): string[] {
+  const prints: string[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    if (msg?.role !== "user" || isSyntheticToolMediaMessage(msg, messages[i - 1])) continue;
+    const text = extractTextContent(msg.content)
+      .replace(SYSTEM_REMINDER_BLOCK, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    const identity = text || (contentHasAttachments(msg.content) ? "\u0000attachments" : "");
+    if (!identity) continue;
+    prints.push(createHash("sha1").update(identity).digest("hex").slice(0, 16));
+  }
+  return prints;
 }
 
 export function contentHasAttachments(content: unknown): boolean {
@@ -979,15 +1015,10 @@ export function withLeadingText(
 }
 
 /**
- * What t3code tells Claude about its host: stated plainly, once, in the
- * appended runtime note. The Claude Code system prompt itself is never
- * replaced or rewritten.
+ * What Claude is told about its host: stated plainly, once, in the appended
+ * runtime note. The Claude Code system prompt itself is never replaced or
+ * rewritten, and it already names the model.
  */
-export function buildRuntimeInstructions(runtime: {
-  modelName?: string;
-  effort?: string;
-}): string {
-  const model = runtime.modelName ? `, as ${runtime.modelName}` : "";
-  const effort = runtime.effort ? ` with ${runtime.effort} reasoning effort` : "";
-  return `<runtime_info>In case you're asked: you are running in OpenChamber through the Claude Code harness${model}${effort}. No need to mention this otherwise.</runtime_info>`;
+export function buildRuntimeInstructions(): string {
+  return `<runtime_info>In case you're asked: you are running in ${currentHost().name} through the Claude Code harness. No need to mention this otherwise.</runtime_info>`;
 }

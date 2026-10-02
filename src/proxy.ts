@@ -9,6 +9,8 @@
  * tool_calls; the follow-up request with tool results resumes the turn.
  */
 import { createHash, randomUUID } from "node:crypto";
+import { currentHost, mcpToolName, openCodeToolName } from "./host.js";
+import { mcpInstructions, openCodeInstructionFiles } from "./opencode-context.js";
 import {
   clearAllBridges,
   deleteBridge,
@@ -16,6 +18,8 @@ import {
   findBridgeByPendingTool,
   getBridge,
   putBridge,
+  stopBridge,
+  stopConversationBridges,
   type ParkedBridge,
   type ParkedToolCall,
   type TurnAccounting,
@@ -23,9 +27,14 @@ import {
 import { buildClaudeCodeChildEnv } from "./auth-env.js";
 import {
   classifyClaudeFailure,
+  failureCodeFor,
   failureHintFor,
   failureStatusFor,
   failureTypeFor,
+  metaFailureText,
+  overloadedResultText,
+  resultErrorText,
+  thrownErrorText,
 } from "./failure.js";
 import {
   decodeClaudeModelSelection,
@@ -33,21 +42,30 @@ import {
 } from "./model-selection.js";
 import { getClaudeModels, modelNameFromId, resolveClaudeModelId } from "./models.js";
 import {
-  openCodeSystemContext,
-  systemContextForwardingEnabled,
-} from "./system-context.js";
-import {
   DIRECTORY_HEADER,
   KIND_HEADER,
   SESSION_HEADER,
   type ClaudeEffort,
 } from "./constants.js";
-import { startClaudeQuery, type ClaudeQueryHandle } from "./query.js";
+import {
+  forkClaudeSession,
+  startClaudeQuery,
+  withGracefulStop,
+  type StoppableClaudeQueryHandle,
+} from "./query.js";
 import {
   clearForeignSessionId,
   conversationKeyFromMessages,
   findClaudeSessionFile,
   getForeignSessionId,
+  getSessionLeafUuid,
+  getSessionTurns,
+  matchTurnHistory,
+  recordTurnStart,
+  rewindSessionTurns,
+  lastChainEntryUuid,
+  sessionChainAfterLeaf,
+  sessionFileHasEntry,
   setForeignSessionId,
 } from "./session-store.js";
 import { log } from "./log.js";
@@ -73,6 +91,7 @@ import {
   openaiToolResultToMcpContent,
   priorMessagesOf,
   promptAsStream,
+  userHistoryFingerprints,
   withConversationContext,
   withLeadingText,
   buildRuntimeInstructions,
@@ -92,6 +111,8 @@ import {
   detectMetaRequestKind,
   metaSystemPrompt,
   codeModeCatalog,
+  skillsCatalog,
+  customAgentPrompt,
   type MetaRequestKind,
   requestKeyNamespace,
 } from "./request-kind.js";
@@ -310,7 +331,7 @@ type ProxyRuntime = {
   server: ReturnType<typeof Bun.serve> | null;
   port: number | null;
   users: number;
-  stopOwner: (() => void) | null;
+  stopOwner: (() => void | Promise<void>) | null;
   /** The owner's teardown for one session's parked turns (same pool). */
   teardownOwnerSession: ((sessionID: string) => string[]) | null;
 };
@@ -340,7 +361,8 @@ function teardownLocalSession(sessionID: string): string[] {
       conversationKey: key,
       pending: bridge.pendingTools.size,
     });
-    deleteBridge(bridge.id);
+    // Graceful: interrupt the CLI so its last events still land, then close.
+    void stopBridge(bridge.id, "Session stopped");
     tornDown.push(key);
   }
   return tornDown;
@@ -365,6 +387,15 @@ export function setClaudeQueryStarter(
   starter: typeof startClaudeQuery | null,
 ): void {
   queryStarter = starter ?? startClaudeQuery;
+}
+
+/** Injectable for tests — production path always uses forkClaudeSession. */
+let sessionForker: typeof forkClaudeSession = forkClaudeSession;
+
+export function setClaudeSessionForker(
+  forker: typeof forkClaudeSession | null,
+): void {
+  sessionForker = forker ?? forkClaudeSession;
 }
 
 export function getClaudeProxyBaseUrl(): string {
@@ -495,7 +526,8 @@ export async function stopProxy(): Promise<void> {
   const stopOwner = runtime.stopOwner ?? clearAllBridges;
   runtime.stopOwner = null;
   runtime.teardownOwnerSession = null;
-  stopOwner();
+  // Parked turns each hold a live claude CLI child; nothing resumes them now.
+  await stopOwner();
   if (runtime.server) {
     runtime.server.stop(true);
     runtime.server = null;
@@ -659,7 +691,7 @@ function selectionFromRequest(
 const META_REQUEST_MODEL = "claude-haiku-4-5";
 
 const UTILITY_SYSTEM_PROMPT =
-  "You are a text generation helper running in OpenChamber through the Claude Code harness. Follow the instructions in the user message and return only the requested output.";
+  `You are a text generation helper running in ${currentHost().name} through the Claude Code harness. Follow the instructions in the user message and return only the requested output.`;
 
 /**
  * One debug line per finished Claude run with the raw token split, so plan
@@ -788,18 +820,17 @@ async function handleChatCompletions(
   // OpenCode is compacting this chat. The Claude session it would resume
   // still holds the full uncompacted context, so drop the binding: the next
   // turn starts a fresh Claude session from the compacted history instead.
-  // OpenCode compacts between steps, often while the turn is parked on a
-  // tool: that live query holds the same full context, and resuming it would
-  // undo the compaction, so it is closed too.
+  // A turn parked on a tool call belongs to that old session too. Left
+  // alive, it re-emits its call to the compacted chat together with the old
+  // context size, and OpenCode compacts again, in a loop. Stop it first, so
+  // its last events can't write the binding back either.
   if (metaKind === "summary") {
     const chatKey = sessionHeader || conversationKeyFromMessages(messages);
-    const live = findBridgeByConversation(requestKeyNamespace(null) + chatKey);
-    if (live) {
-      log.info("[opencode-claude] compaction with a live turn, closing it", {
-        conversationKey: live.conversationKey,
-        pending: live.pendingTools.size,
+    const stopped = await stopConversationBridges(chatKey, "Chat compacted");
+    if (stopped > 0) {
+      log.info("[opencode-claude] stopped the turn of a chat being compacted", {
+        conversationKey: chatKey,
       });
-      deleteBridge(live.id);
     }
     clearForeignSessionId(chatKey);
   }
@@ -868,6 +899,14 @@ async function handleChatCompletions(
     }
     if (steeringToolId) {
       for (const m of freshSteering) existing.forwardedSteering.add(m.key);
+      // The history now ends at the steering message: a later revert to
+      // before it rewinds to where the turn was when it arrived.
+      if (!existing.metaKind) {
+        const prints = userHistoryFingerprints(messages);
+        if (prints.length > 0) {
+          recordTurnStart(existing.conversationKey, { count: prints.length, hash: prints.at(-1)! });
+        }
+      }
       log.info("[opencode-claude] forwarding mid-turn user messages", {
         conversationKey: existing.conversationKey,
         blocks: steering.length,
@@ -914,6 +953,91 @@ async function handleChatCompletions(
     }
   }
 
+  // Everything from here spawns a claude process. One chat spawns one at a
+  // time: a second request waits, then stops what the first one started.
+  const releaseSpawnLock = await acquireSpawnLock(conversationKey);
+  try {
+    return await startNewTurn({
+      req,
+      body,
+      messages,
+      sessionHeader,
+      metaKind,
+      conversationKey,
+      selection,
+      model,
+      stream,
+      toolResults,
+      releaseSpawnLock,
+    });
+  } finally {
+    releaseSpawnLock();
+  }
+}
+
+const spawnLocks = new Map<string, Promise<void>>();
+
+/**
+ * Serialize turn starts per conversation. Resolves with an idempotent
+ * release; the lock is held only until the new turn is in the bridge pool.
+ */
+async function acquireSpawnLock(key: string): Promise<() => void> {
+  const previous = spawnLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => (release = resolve));
+  const tail = previous.then(() => held);
+  spawnLocks.set(key, tail);
+  await previous;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    release();
+    if (spawnLocks.get(key) === tail) spawnLocks.delete(key);
+  };
+}
+
+async function startNewTurn(input: {
+  req: Request;
+  body: ChatCompletionRequest;
+  messages: OpenAIMessage[];
+  sessionHeader: string | null;
+  metaKind: MetaRequestKind;
+  conversationKey: string;
+  selection: { modelId: string; effort?: ClaudeEffort };
+  model: string;
+  stream: boolean;
+  toolResults: Map<string, McpToolResultContent[]>;
+  releaseSpawnLock: () => void;
+}): Promise<Response> {
+  const {
+    req,
+    body,
+    messages,
+    sessionHeader,
+    metaKind,
+    conversationKey,
+    selection,
+    model,
+    stream,
+    toolResults,
+  } = input;
+  // A new turn while an earlier one of this chat still runs (OpenCode
+  // restarted, retried, or moved on): stop the old one first and wait for
+  // its process to close. Two claude processes writing the same session
+  // file fork its history.
+  const existing = findBridgeByConversation(conversationKey);
+  if (metaKind === null && existing) {
+    log.warn("[opencode-claude] stopping an earlier turn still running for this chat", {
+      conversationKey,
+    });
+  }
+  // Also waits for a stop already running in the background (the session
+  // was interrupted a moment ago, the reaper fired).
+  if (metaKind === null) {
+    await stopConversationBridges(conversationKey, "Superseded by a newer turn");
+  }
+
   log.info("[opencode-claude] chat completions", {
     conversationKey,
     sessionHeader,
@@ -921,7 +1045,7 @@ async function handleChatCompletions(
     toolCount: Array.isArray(body.tools) ? body.tools.length : 0,
     messageCount: messages.length,
     hasToolResults: toolResults.size > 0,
-    bridgePending: existing?.pendingTools.size ?? 0,
+    stoppedEarlierTurn: Boolean(metaKind === null && existing),
   });
 
   const env = buildClaudeCodeChildEnv();
@@ -935,7 +1059,7 @@ async function handleChatCompletions(
     process.env.OPENCODE_CLAUDE_CWD || requestDirectory || process.cwd();
   const bridgeId = randomUUID();
   const pendingTools = new Map<string, ParkedToolCall>();
-  let handle: ClaudeQueryHandle | null = null;
+  let handle: StoppableClaudeQueryHandle | null = null;
   let parked = false;
   let parkWaiters: Array<() => void> = [];
   // The assistant message is still streaming: sibling tool calls may follow
@@ -965,7 +1089,7 @@ async function handleChatCompletions(
         ev.content_block?.type === "tool_use" &&
         typeof ev.content_block.name === "string"
       ) {
-        messageToolNames.push(ev.content_block.name.replace(/^mcp__opencode__/, ""));
+        messageToolNames.push(openCodeToolName(ev.content_block.name));
       }
     }
   };
@@ -1079,7 +1203,8 @@ async function handleChatCompletions(
   }
 
   let resume = getForeignSessionId(conversationKey);
-  if (resume && !findClaudeSessionFile(resume)) {
+  const sessionFile = resume ? findClaudeSessionFile(resume) : null;
+  if (resume && !sessionFile) {
     // The claude CLI resumes by looking the session up on disk. A missing
     // transcript (cleanup, different machine, pruned projects dir) would
     // silently start a context-free session — drop the stale binding and
@@ -1090,6 +1215,122 @@ async function handleChatCompletions(
     });
     clearForeignSessionId(conversationKey);
     resume = undefined;
+  }
+
+  // The user reverted or edited in OpenCode: the history before this prompt
+  // is shorter than, or differs from, what the Claude session holds. Resume
+  // from the boundary where the two still agree, or, when none does, start
+  // over from the history OpenCode has.
+  // Where the resume has to be cut through a fork (see below): the session
+  // to copy and the entry to cut at.
+  let forkAt: { sessionId: string; leafUuid: string } | undefined;
+  if (resume && sessionFile && !isMetaRequest) {
+    const match = matchTurnHistory(
+      getSessionTurns(conversationKey),
+      userHistoryFingerprints(priorMessages),
+    );
+    // A boundary may sit in an earlier session of this chat (before a
+    // fork); its file must still hold the leaf.
+    const source = match.kind === "rewind" ? (match.sessionId ?? resume) : undefined;
+    const sourceFile =
+      source === undefined ? null : source === resume ? sessionFile : findClaudeSessionFile(source);
+    if (
+      match.kind === "rewind" &&
+      match.leafUuid &&
+      source &&
+      sourceFile &&
+      sessionFileHasEntry(sourceFile, match.leafUuid)
+    ) {
+      log.info("[opencode-claude] OpenCode history went back; resuming from an earlier turn", {
+        conversationKey,
+        turn: match.index,
+        session: source,
+      });
+      rewindSessionTurns(conversationKey, match.index);
+      // The undone turns descend from that leaf, so a plain resume would
+      // bring them back. Unless nothing came after it: a retry of a turn
+      // that failed before Claude wrote anything resumes as is.
+      const untouched =
+        source === resume &&
+        lastChainEntryUuid(sourceFile) === match.leafUuid &&
+        sessionChainAfterLeaf(sourceFile, match.leafUuid) === "clean";
+      if (!untouched) forkAt = { sessionId: source, leafUuid: match.leafUuid };
+    } else if (match.kind === "rewind" && !match.leafUuid) {
+      // A boundary recorded before this chat's leaf was known: nothing to
+      // cut at, so resume the whole session as before.
+      log.info("[opencode-claude] OpenCode history went back to a turn with no resume point; resuming the session", {
+        conversationKey,
+        turn: match.index,
+      });
+    } else if (match.kind === "rewind" || match.kind === "diverged") {
+      log.warn("[opencode-claude] OpenCode history no longer matches the Claude session; transferring history", {
+        conversationKey,
+        match: match.kind,
+      });
+      clearForeignSessionId(conversationKey);
+      resume = undefined;
+    }
+  }
+  // Resume from the last entry this plugin saw. Another claude process
+  // writing the same session (a turn orphaned by an OpenCode restart) can
+  // leave a side branch after it, and a plain resume may follow that branch.
+  // The CLI's resumeSessionAt doesn't help there: it only searches the chain
+  // it picked and fails with "No message found". A fork cut at the leaf
+  // holds exactly our chain, so the resume goes through one when needed.
+  if (resume && sessionFile && !isMetaRequest && !forkAt) {
+    const leafUuid = getSessionLeafUuid(conversationKey);
+    if (leafUuid) {
+      const state = sessionChainAfterLeaf(sessionFile, leafUuid);
+      if (state === "branched") {
+        log.info("[opencode-claude] Claude session branched after this chat's last turn; resuming through a fork", {
+          conversationKey,
+        });
+        forkAt = { sessionId: resume, leafUuid };
+      } else if (state === "missing") {
+        log.info("[opencode-claude] last seen entry is not in the Claude session; resuming the session as is", {
+          conversationKey,
+        });
+      }
+    }
+  }
+  if (resume && forkAt) {
+    try {
+      const forked = await sessionForker(forkAt.sessionId, forkAt.leafUuid);
+      log.info("[opencode-claude] resuming a fork of the Claude session", {
+        conversationKey,
+        from: forkAt.sessionId,
+        fork: forked,
+      });
+      // Fork uuids are fresh. The current boundary moves to the fork's last
+      // entry, the copy of the leaf it was cut at; older boundaries keep
+      // pointing into the sessions they were recorded in.
+      const forkFile = findClaudeSessionFile(forked);
+      setForeignSessionId(conversationKey, forked, {
+        modelId: model,
+        cwd,
+        leafUuid: forkFile ? lastChainEntryUuid(forkFile) : undefined,
+      });
+      resume = forked;
+    } catch (error) {
+      log.warn("[opencode-claude] could not fork the Claude session; transferring history", {
+        conversationKey,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      clearForeignSessionId(conversationKey);
+      resume = undefined;
+    }
+  }
+
+  if (!isMetaRequest) {
+    const prints = userHistoryFingerprints(messages);
+    const before = userHistoryFingerprints(priorMessages);
+    if (prints.length > 0) {
+      recordTurnStart(
+        conversationKey,
+        { count: prints.length, hash: prints.at(-1)! },
+        before.length > 0 ? { count: before.length, hash: before.at(-1)! } : undefined,
+      );
+    }
   }
 
   // No resumable Claude session (first claude-code turn of this chat, model
@@ -1137,7 +1378,7 @@ async function handleChatCompletions(
   const toolAliases = bridgeOpenCodeTools
     ? Object.fromEntries(
         openCodeToolNames.flatMap((name) => {
-          const mcpName = `mcp__opencode__${name}`;
+          const mcpName = mcpToolName(name);
           const aliases: Array<[string, string]> = [[name, mcpName]];
           const titled = name.charAt(0).toUpperCase() + name.slice(1);
           if (titled !== name) aliases.push([titled, mcpName]);
@@ -1147,10 +1388,6 @@ async function handleChatCompletions(
           if (name === "write") aliases.push(["Write", mcpName]);
           if (name === "glob") aliases.push(["Glob", mcpName]);
           if (name === "grep") aliases.push(["Grep", mcpName]);
-          // Claude Code's built-in todo habit must land on OpenCode's todo
-          // tools or plans die with the turn (never persisted/transferred).
-          if (name === "todowrite") aliases.push(["TodoWrite", mcpName]);
-          if (name === "todoread") aliases.push(["TodoRead", mcpName]);
           return aliases;
         }),
       )
@@ -1192,43 +1429,43 @@ async function handleChatCompletions(
       ? mainPrompt || " "
       : promptAsStream(mainPrompt);
 
-  const hasTodoWrite = openCodeToolNames.includes("todowrite");
-  const systemContext =
-    !isMetaRequest && systemContextForwardingEnabled() ? openCodeSystemContext(messages) : "";
-  // The forwarded context already carries the Code Mode catalog; without
-  // forwarding, pass just that section so Claude still knows what execute reaches.
-  const bridgesExecute = bridgeOpenCodeTools && openCodeToolNames.includes("execute");
-  const codeMode =
-    bridgesExecute && !systemContext.includes("# Code Mode") ? codeModeCatalog(messages) : "";
-  const hasCodeMode = bridgesExecute && (Boolean(codeMode) || systemContext.includes("# Code Mode"));
+  const codeMode = openCodeToolNames.includes("execute") ? codeModeCatalog(messages) : "";
+  const skills = openCodeToolNames.includes("skill") ? skillsCatalog(messages) : "";
+  const agentPrompt = customAgentPrompt(messages);
+  const instructionFiles = isMetaRequest ? "" : openCodeInstructionFiles(messages, cwd);
+  const mcpNotes = openCodeToolNames.includes("execute") ? mcpInstructions(messages) : "";
+  // Built once: the same text goes to the preset append and to the accounting
+  // below, which reports how many characters each section of the turn costs.
   const systemAppend = [
-    buildRuntimeInstructions({
-      modelName: getClaudeModels().find((m) => m.id === selection.modelId)?.name,
-      effort: selection.effort,
-    }),
+    buildRuntimeInstructions(),
+    ...(agentPrompt
+      ? [
+          `# Agent role (from the agent configuration in ${currentHost().name}; it defines who you are in this session and takes precedence over the generic role above)\n\n${agentPrompt}`,
+        ]
+      : []),
     ...(bridgeOpenCodeTools
       ? [
           [
-            "Built-in Claude Code tools are disabled. Use only the mcp__opencode__* tools provided for this turn; they execute via OpenCode.",
+            `Built-in Claude Code tools are disabled. Use only the ${mcpToolName("*")} tools provided for this turn; they execute via ${currentHost().name}.`,
             "Batch independent tool calls into a single turn instead of calling them one at a time.",
-            ...(hasTodoWrite
-              ? [
-                  "For any multi-step work, ALWAYS write the plan with the mcp__opencode__todowrite tool and keep it updated as you progress. A plan that only exists in your text is lost when the session is restored or handed to another agent.",
-                ]
-              : []),
           ].join(" "),
         ]
       : []),
-    systemContext,
-    codeMode,
-    ...(hasCodeMode ? ["The `execute` tool in the Code Mode section is mcp__opencode__execute."] : []),
-  ]
-    .filter(Boolean)
-    .join("\n\n");
+    ...(bridgeOpenCodeTools && codeMode
+      ? [`${codeMode}\n\nThe \`execute\` tool above is ${mcpToolName("execute")}.`]
+      : []),
+    ...(bridgeOpenCodeTools && mcpNotes ? [mcpNotes] : []),
+    ...(bridgeOpenCodeTools && skills
+      ? [`${skills}\n\nThe skill tool above is ${mcpToolName("skill")}.`]
+      : []),
+    ...(instructionFiles
+      ? [`# Project instructions (loaded by ${currentHost().name})\n\n${instructionFiles}`]
+      : []),
+  ].join("\n\n");
   // Generation is an explicit model choice by the caller; keep it.
   const queryModel =
     metaKind === "title" || metaKind === "summary" ? META_REQUEST_MODEL : model;
-  handle = await queryStarter({
+  handle = withGracefulStop(await queryStarter({
     prompt: queryPrompt,
     cwd,
     // Titles and compaction summaries run as their own one-shot turn that
@@ -1257,7 +1494,7 @@ async function handleChatCompletions(
     tools: [],
     toolAliases,
     allowedTools: bridgeOpenCodeTools
-      ? [...openCodeToolNames, ...localToolNames].map((n) => `mcp__opencode__${n}`)
+      ? [...openCodeToolNames, ...localToolNames].map((n) => mcpToolName(n))
       : undefined,
     permissionMode: bridgeOpenCodeTools ? "bypassPermissions" : "dontAsk",
     allowDangerouslySkipPermissions: bridgeOpenCodeTools,
@@ -1273,7 +1510,7 @@ async function handleChatCompletions(
           ...(excludeDynamicSections() ? { excludeDynamicSections: true } : {}),
           append: systemAppend,
         },
-  });
+  }));
 
   const accounting: TurnAccounting = {
     kind: metaKind ?? "agent",
@@ -1293,6 +1530,7 @@ async function handleChatCompletions(
   const bridge: ParkedBridge = {
     id: bridgeId,
     conversationKey,
+    metaKind,
     handle,
     pendingTools,
     accounting,
@@ -1300,7 +1538,24 @@ async function handleChatCompletions(
     forwardedSteering: new Set(),
     createdAt: Date.now(),
   };
+  // Session binding and resume point follow every event the turn yields,
+  // including the ones stop() reads after an interrupt: for a turn stopped
+  // while parked on a tool, those are the CLI's rejected tool_result and
+  // its "[Request interrupted by user for tool use]" entry, so the next turn
+  // resumes after the interruption instead of at the unanswered tool_use.
+  if (!isMetaRequest) {
+    handle.onEvent((event) => {
+      const sessionId = extractSessionId(event);
+      if (!sessionId) return;
+      setForeignSessionId(conversationKey, sessionId, {
+        modelId: model,
+        cwd,
+        leafUuid: mainChainUuid(event),
+      });
+    });
+  }
   putBridge(bridge);
+  input.releaseSpawnLock();
 
   let reapTimer: ReturnType<typeof setTimeout> | null = null;
   const clearParkReap = () => {
@@ -1324,7 +1579,7 @@ async function handleChatCompletions(
           : "[opencode-claude] reaping parked turn past its TTL",
         { conversationKey, pending: pendingTools.size },
       );
-      deleteBridge(bridgeId);
+      void stopBridge(bridgeId);
     }, ms);
     reapTimer.unref?.();
   };
@@ -1336,6 +1591,8 @@ async function handleChatCompletions(
     let handedOff = false;
     // The settle window ran out: hand off whatever the group has.
     let settled = false;
+    // Delay the CLI announced for its next API retry.
+    let retryWaitMs = 0;
     try {
       while (true) {
         // Parked and the message is closed: hand every collected call to
@@ -1382,7 +1639,8 @@ async function handleChatCompletions(
         // session forever. Any event — or a park — resets the clock.
         let stallTimer: ReturnType<typeof setTimeout> | null = null;
         const stallPromise = new Promise<never>((_, reject) => {
-          const ms = turnStallMs();
+          // An API retry announces its wait; that silence is expected.
+          const ms = turnStallMs() + retryWaitMs;
           const span =
             ms < 90_000
               ? `${Math.round(ms / 1000)}s`
@@ -1439,14 +1697,7 @@ async function handleChatCompletions(
         if (raced.value.done) break;
         const event = raced.value.value;
         trackMessageState(event);
-        const sessionId = extractSessionId(event);
-        // A closed bridge (compaction, teardown) must not rebind its session.
-        if (sessionId && !isMetaRequest && getBridge(bridgeId) === bridge) {
-          setForeignSessionId(conversationKey, sessionId, {
-            modelId: model,
-            cwd,
-          });
-        }
+        retryWaitMs = apiRetryDelayMs(event);
         logTurnUsage(event, { conversationKey, metaKind, model: queryModel });
         const fallback = event as {
           type?: string;
@@ -1496,13 +1747,32 @@ async function handleChatCompletions(
   if (stream) {
     const probe = await probeTurnEvents(consumeStream());
     if (probe.status === "failed") {
-      return failureResponse(probe.errorText, conversationKey);
+      return failureResponse(probe.errorText, conversationKey, metaKind);
     }
     return streamOpenAIResponse(probe.replay, body.model || model, bridge);
   }
   return collectTurnResponse(consumeStream(), body.model || model, bridge);
 }
 
+
+/**
+ * Transcript uuid of a main-chain (not subagent) assistant or user event.
+ *
+ * Compaction needs nothing extra. The CLI emits the compact summary as a
+ * synthetic (not replayed) user event right after system/compact_boundary,
+ * and that summary is the entry to resume from. The boundary's own uuid is
+ * deliberately not a leaf: checked live, a resume cut there starts the
+ * compacted chain before the summary, so Claude loses the whole
+ * conversation.
+ */
+function mainChainUuid(event: unknown): string | undefined {
+  if (!event || typeof event !== "object") return undefined;
+  const e = event as Record<string, unknown>;
+  if (e.type !== "assistant" && e.type !== "user") return undefined;
+  if (e.parent_tool_use_id) return undefined;
+  if (e.isReplay === true) return undefined;
+  return typeof e.uuid === "string" && e.uuid ? e.uuid : undefined;
+}
 
 function extractSessionId(event: unknown): string | null {
   if (!event || typeof event !== "object") return null;
@@ -1784,7 +2054,7 @@ export async function buildOpenCodeMcpServer(
     listed.sort((x, y) => (x.name < y.name ? -1 : x.name > y.name ? 1 : 0));
 
     const server = createSdkMcpServer({
-      name: "opencode",
+      name: currentHost().mcpServer,
       // Server-level alwaysLoad ORs with per-tool flags, so deferral only
       // works when the server itself does not force every tool in.
       alwaysLoad: !deferToolsEnabled(),
@@ -1802,7 +2072,7 @@ export async function buildOpenCodeMcpServer(
       );
     }
 
-    return { opencode: server };
+    return { [currentHost().mcpServer]: server };
   } catch (err) {
     log.warn(
       "[opencode-claude] failed to build OpenCode MCP server",
@@ -1881,10 +2151,13 @@ async function collectTurnResponse(
       }
     }
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    recordRateLimitErrorText(message);
-    forgetDeadSession(bridge.conversationKey, message);
-    noteError(message);
+    // Null: only CLI diagnostics after an error result already noted.
+    const message = thrownErrorText(err) ?? (errorText ? null : "Claude turn failed");
+    if (message) {
+      recordRateLimitErrorText(message);
+      forgetDeadSession(bridge.conversationKey, message);
+      noteError(message);
+    }
   }
 
   const usage = resolveTurnUsage(usageTracker.total(), resultUsage);
@@ -1903,12 +2176,29 @@ async function collectTurnResponse(
 
   // Buffered responses have not committed HTTP headers yet. Even if an agent
   // produced partial work first, preserve the real 429 so OpenCode starts its
-  // retry countdown instead of treating the run as a successful answer.
+  // retry countdown instead of treating the run as a successful answer, and
+  // the real context overflow so OpenCode compacts instead.
+  const failureKind = errorText ? classifyClaudeFailure(errorText) : null;
   if (
     errorText &&
-    (!sawContent || classifyClaudeFailure(errorText) === "rate_limit")
+    (!sawContent || failureKind === "rate_limit" || failureKind === "context_overflow")
   ) {
-    return failureResponse(errorText, bridge.conversationKey);
+    // The refusal is the real cause; the failure after it only says the
+    // turn produced nothing.
+    return failureResponse(
+      mapState.refusalText ?? errorText,
+      bridge.conversationKey,
+      bridge.metaKind,
+    );
+  }
+
+  const finishReason = toolCalls.length
+    ? "tool_calls"
+    : errorText
+      ? "stop"
+      : finishReasonFor(mapState.stopReason);
+  if (finishReason === "content_filter" && !suppressReasoning) {
+    reasoning += refusalNote(mapState) ?? "";
   }
 
   return Response.json({
@@ -1933,7 +2223,7 @@ async function collectTurnResponse(
               }
             : {}),
         },
-        finish_reason: toolCalls.length ? "tool_calls" : "stop",
+        finish_reason: finishReason,
       },
     ],
     ...(usage ? { usage: clientUsage(usage) } : {}),
@@ -1954,10 +2244,19 @@ function rawProbeKind(event: unknown): "content" | "error" | "neutral" {
   if (!event || typeof event !== "object") return "neutral";
   const e = event as Record<string, unknown>;
   if (e.type === "__park__") return "content";
+  // system events (api_retry included) stay neutral: the CLI retrying is
+  // not proof the turn will produce anything, and if its retries run out
+  // the failure must still become a real HTTP error. The retry notes are
+  // buffered and replayed once content arrives. OpenCode sets no response
+  // header timeout by default, so holding the head meanwhile is safe, and
+  // each retry resets the stall watchdog (plus the announced delay).
   if (e.type === "assistant") {
     return assistantErrorText(e) ? "error" : "content";
   }
-  if (e.type === "result") return e.is_error ? "error" : "content";
+  if (e.type === "result") {
+    // Nothing reached the probe yet, so a 5xx "success" produced nothing.
+    return e.is_error || overloadedResultText(e) ? "error" : "content";
+  }
   if (e.type === "stream_event" && e.event && typeof e.event === "object") {
     const ev = e.event as Record<string, unknown>;
     if (
@@ -1994,9 +2293,7 @@ function rawErrorText(event: unknown): string {
   const e = (event ?? {}) as Record<string, unknown>;
   const assistantText = assistantErrorText(e);
   if (assistantText) return assistantText;
-  if (typeof e.result === "string" && e.result) return e.result;
-  if (typeof e.error === "string" && e.error) return e.error;
-  return "Claude turn failed";
+  return overloadedResultText(e) ?? resultErrorText(e);
 }
 
 async function* chainBuffered(
@@ -2024,18 +2321,24 @@ async function probeTurnEvents(
 ): Promise<TurnProbe> {
   const iterator = events[Symbol.asyncIterator]();
   const buffered: unknown[] = [];
+  // A refusal without fallback, when the turn then fails, is the cause.
+  let refusal: string | null = null;
   const fail = async (errorText: string): Promise<TurnProbe> => {
     try {
       await iterator.return?.(undefined as never);
     } catch {
       // ignore
     }
-    return { status: "failed", errorText };
+    return { status: "failed", errorText: refusal ?? errorText };
   };
   try {
     while (true) {
       const next = await iterator.next();
       if (next.done) break;
+      const raw = next.value as Record<string, unknown> | null;
+      if (raw?.type === "system" && raw.subtype === "model_refusal_no_fallback") {
+        refusal = refusalText(raw as Parameters<typeof refusalText>[0]);
+      }
       const kind = rawProbeKind(next.value);
       if (kind === "error") {
         return fail(rawErrorText(next.value));
@@ -2046,7 +2349,7 @@ async function probeTurnEvents(
       }
     }
   } catch (err) {
-    return fail(err instanceof Error ? err.message : String(err));
+    return fail(thrownErrorText(err) ?? "Claude turn failed");
   }
   return fail("Claude Code ended the turn without any output");
 }
@@ -2060,9 +2363,11 @@ const PASS_THROUGH_4XX = new Set([400, 404, 413, 422]);
  * follow-up requests get a cheap 429 without spawning a doomed CLI turn.
  */
 function failureResponse(
-  errorText: string,
+  rawErrorText: string,
   conversationKey: string,
+  metaKind?: string | null,
 ): Response {
+  const errorText = metaFailureText(rawErrorText, metaKind);
   recordRateLimitErrorText(errorText);
   forgetDeadSession(conversationKey, errorText);
   const kind = classifyClaudeFailure(errorText);
@@ -2126,7 +2431,7 @@ function failureResponse(
       error: {
         message: hint ? `${errorText} ${hint}` : errorText,
         type: refused ? "invalid_request_error" : failureTypeFor(kind),
-        code: kind === "auth" ? "claude_auth" : "claude_turn_failed",
+        code: failureCodeFor(kind),
       },
     },
     { status: refused ?? failureStatusFor(kind) },
@@ -2327,20 +2632,37 @@ function streamOpenAIResponse(
           }
         }
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
         // A limit/result failure typically arrives here right after the SDK
         // emitted the same text as a result event — dedupe via sendError.
-        recordRateLimitErrorText(message);
-        forgetDeadSession(bridge.conversationKey, message);
-        log.warn("[opencode-claude] stream iterator failed", {
-          conversationKey: bridge.conversationKey,
-          kind: classifyClaudeFailure(message),
-          message: message.slice(0, 300),
-        });
-        sendError(message);
+        // Only diagnostics left: the result event said it all already.
+        const message =
+          thrownErrorText(err) ?? (lastErrorNorm ? null : "Claude turn failed");
+        if (message) {
+          recordRateLimitErrorText(message);
+          forgetDeadSession(bridge.conversationKey, message);
+          log.warn("[opencode-claude] stream iterator failed", {
+            conversationKey: bridge.conversationKey,
+            kind: classifyClaudeFailure(message),
+            message: message.slice(0, 300),
+          });
+          sendError(message);
+        }
         finishReason = "stop";
       }
 
+      if (finishReason === "stop" && !lastErrorNorm) {
+        finishReason = finishReasonFor(mapState.stopReason);
+        const note = finishReason === "content_filter" ? refusalNote(mapState) : null;
+        if (note && !suppressReasoning) {
+          send({
+            id: completionId,
+            object: "chat.completion.chunk",
+            created,
+            model,
+            choices: [{ index: 0, delta: { reasoning_content: note }, finish_reason: null }],
+          });
+        }
+      }
       const usage = resolveTurnUsage(usageTracker.total(), resultUsage);
       recordUsage({
         conversationKey: bridge.conversationKey,
@@ -2381,7 +2703,7 @@ function streamOpenAIResponse(
       // the turn down instead of leaking the CLI process and the bridge.
       streamClosed = true;
       if (heartbeat) clearInterval(heartbeat);
-      deleteBridge(bridge.id);
+      void stopBridge(bridge.id);
     },
   });
 
@@ -2434,7 +2756,7 @@ function assistantErrorText(event: Record<string, unknown>): string | null {
 
 /** claude CLI text when `resume` points at a session it cannot load. */
 const LOST_SESSION_PATTERN =
-  /no conversation found|session\b.*\bnot found|could not (?:find|load|resume).*(?:session|conversation)/i;
+  /no conversation found|no message found with message\.uuid|session\b.*\bnot found|could not (?:find|load|resume).*(?:session|conversation)/i;
 
 /**
  * A resume-target-missing error means the stored foreign session id is dead.
@@ -2514,13 +2836,119 @@ function deferToolsEnabled(): boolean {
  * `assistant` message payloads repeat the same content after partials and
  * would double-print if both were forwarded.
  */
-type MapState = { messageId: string | null };
+type MapState = {
+  messageId: string | null;
+  /** Claude's stop_reason for the main conversation, latest wins. */
+  stopReason?: string | null;
+  /** A refusal was already explained to the user in this response. */
+  refusalNoted?: boolean;
+  /** Why Claude refused, when the CLI said so (model_refusal_no_fallback). */
+  refusalText?: string;
+  /** CLI warnings already shown in this response, so each shows once. */
+  shownNotices?: Set<string>;
+  /** This response carried answer text or tool calls. */
+  producedContent?: boolean;
+};
+
+/**
+ * The CLI hit a retryable API error and retries on its own (up to
+ * max_retries). error_status is null for connection errors.
+ */
+export function apiRetryNote(event: Record<string, unknown>): string {
+  const status = typeof event.error_status === "number" ? event.error_status : null;
+  const what = status ? `Anthropic returned ${status}` : "Connection to Anthropic failed";
+  const delay = Number(event.retry_delay_ms);
+  const wait = Number.isFinite(delay) && delay >= 1000 ? ` in ${Math.round(delay / 1000)}s` : "";
+  const attempt = Number(event.attempt);
+  const max = Number(event.max_retries);
+  const count =
+    Number.isFinite(attempt) && Number.isFinite(max) && max > 0 ? ` (attempt ${attempt}/${max})` : "";
+  return `\n[api] ${what}, retrying${wait}${count}\n`;
+}
+
+/** Wait an api_retry event announces before the next attempt, else 0. */
+function apiRetryDelayMs(event: unknown): number {
+  const e = event as { type?: unknown; subtype?: unknown; retry_delay_ms?: unknown } | null;
+  if (e?.type !== "system" || e.subtype !== "api_retry") return 0;
+  const delay = Number(e.retry_delay_ms);
+  return Number.isFinite(delay) && delay > 0 ? delay : 0;
+}
+
+/**
+ * Claude refused and no fallback model retried the request. The CLI's
+ * api_refusal_explanation is the API's own reason; `content` is its notice.
+ */
+export function refusalText(event: {
+  api_refusal_explanation?: string | null;
+  api_refusal_category?: string | null;
+  content?: string;
+}): string {
+  const why = event.api_refusal_explanation?.trim() || event.content?.trim();
+  const category = event.api_refusal_category ? ` (${event.api_refusal_category})` : "";
+  return `Claude declined this request${category}${why ? `: ${why}` : "."}`;
+}
+
+/**
+ * CLI notices worth a line in the reasoning stream: high-priority
+ * notifications (context-limit warnings and the like) and warning-level
+ * informational messages (a Stop hook refused to continue). Everything
+ * else is Claude Code UI chrome. Each shows once per response.
+ */
+function cliNotice(e: Record<string, unknown>, state: MapState | undefined): string | null {
+  let key: string | null = null;
+  let text: string | null = null;
+  if (
+    e.subtype === "notification" &&
+    (e.priority === "high" || e.priority === "immediate") &&
+    typeof e.text === "string" &&
+    e.text.trim()
+  ) {
+    key = `notification:${typeof e.key === "string" ? e.key : e.text}`;
+    text = e.text.trim();
+  } else if (
+    e.subtype === "informational" &&
+    e.level === "warning" &&
+    typeof e.content === "string" &&
+    e.content.trim()
+  ) {
+    text = e.content.trim();
+    key = `informational:${text}`;
+  }
+  if (!key || !text) return null;
+  if (state) {
+    state.shownNotices ??= new Set();
+    if (state.shownNotices.has(key)) return null;
+    state.shownNotices.add(key);
+  }
+  return `\n[claude-code] ${text}\n`;
+}
+
+/**
+ * OpenAI finish_reason for a response that ended without tool calls.
+ * OpenCode treats "length" as a truncated answer and "content_filter" as a
+ * blocked one; everything else is a normal stop.
+ */
+export function finishReasonFor(stopReason: string | null | undefined): string {
+  if (stopReason === "max_tokens") return "length";
+  if (stopReason === "refusal") return "content_filter";
+  return "stop";
+}
+
+const REFUSAL_NOTE = "\n[refusal] Claude declined to answer this request.\n";
+
+/** Note to show when the response ends on a refusal nobody explained yet. */
+function refusalNote(state: MapState): string | null {
+  if (state.stopReason !== "refusal" || state.refusalNoted) return null;
+  state.refusalNoted = true;
+  return REFUSAL_NOTE;
+}
 
 function mapSdkEvent(event: unknown, state?: MapState): MappedEvent {
   if (!event || typeof event !== "object") return { kind: "ignore" };
   const e = event as Record<string, unknown>;
 
   if (e.type === "__park__" && Array.isArray(e.tools)) {
+    if (state) state.producedContent = true;
     return { kind: "park", tools: e.tools as ParkedToolCall[] };
   }
 
@@ -2536,6 +2964,24 @@ function mapSdkEvent(event: unknown, state?: MapState): MappedEvent {
     const state = recordRateLimitInfo(rawInfo);
     const note = maybeRateLimitNote(state, rawInfo);
     return note ? { kind: "reasoning", text: note } : { kind: "ignore" };
+  }
+
+  if (e.type === "system" && e.subtype === "api_retry") {
+    return { kind: "reasoning", text: apiRetryNote(e) };
+  }
+
+  if (e.type === "system" && e.subtype === "model_refusal_no_fallback") {
+    const text = refusalText(e as Parameters<typeof refusalText>[0]);
+    if (state) {
+      state.refusalNoted = true;
+      state.refusalText = text;
+    }
+    return { kind: "reasoning", text: `\n[refusal] ${text}\n` };
+  }
+
+  if (e.type === "system") {
+    const notice = cliNotice(e, state);
+    if (notice) return { kind: "reasoning", text: notice };
   }
 
   if (e.type === "system" && e.subtype === "model_refusal_fallback") {
@@ -2567,6 +3013,10 @@ function mapSdkEvent(event: unknown, state?: MapState): MappedEvent {
       return usage ? { kind: "usage-delta", usage, messageId: id } : { kind: "ignore" };
     }
     if (ev.type === "message_delta") {
+      const stopReason = (ev.delta as { stop_reason?: unknown } | undefined)?.stop_reason;
+      if (state && !e.parent_tool_use_id && typeof stopReason === "string") {
+        state.stopReason = stopReason;
+      }
       const usage = usageFromAnthropic(ev.usage);
       return usage
         ? { kind: "usage-delta", usage, messageId: state?.messageId ?? null }
@@ -2575,6 +3025,7 @@ function mapSdkEvent(event: unknown, state?: MapState): MappedEvent {
     if (ev.type === "content_block_delta" && ev.delta && typeof ev.delta === "object") {
       const delta = ev.delta as Record<string, unknown>;
       if (delta.type === "text_delta" && typeof delta.text === "string") {
+        if (state && delta.text) state.producedContent = true;
         return { kind: "text", text: delta.text };
       }
       if (
@@ -2633,13 +3084,15 @@ function mapSdkEvent(event: unknown, state?: MapState): MappedEvent {
 
   if (e.type === "result") {
     const usage = usageFromSdkResult(event);
+    if (state && typeof e.stop_reason === "string") state.stopReason = e.stop_reason;
+    // An overload the CLI reported as success. With an answer already out
+    // it is only a late hiccup; with nothing out it is the turn's failure.
+    const overloaded = overloadedResultText(e);
+    if (overloaded && !state?.producedContent) {
+      return { kind: "error", text: overloaded, usage };
+    }
     if (e.is_error) {
-      const text =
-        typeof e.result === "string"
-          ? e.result
-          : typeof e.error === "string"
-            ? e.error
-            : "Claude turn failed";
+      const text = resultErrorText(e);
       // Hard subscription limit? Record it so the gate + counter activate.
       const limited = recordRateLimitErrorText(text);
       let note = text;
@@ -2662,6 +3115,7 @@ function mapSdkEvent(event: unknown, state?: MapState): MappedEvent {
 
   // Fallback for SDK builds that emit bare text deltas without stream_event
   if (typeof e.text === "string" && e.type === "text_delta") {
+    if (state && e.text) state.producedContent = true;
     return { kind: "text", text: e.text };
   }
 

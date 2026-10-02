@@ -12,6 +12,10 @@ async function main() {
   process.env.XDG_DATA_HOME = mkdtempSync(`${tmpdir()}/opencode-claude-smoke-`);
   // Mock turns must not append to the operator's real usage log.
   process.env.OPENCODE_CLAUDE_USAGE_LOG = "0";
+  // Mocked turns ignore interrupt(); don't wait the real grace for them.
+  process.env.OPENCODE_CLAUDE_STOP_GRACE_MS = "50";
+  // Fake Claude transcripts go to a temp config dir, never ~/.claude.
+  process.env.CLAUDE_CONFIG_DIR = mkdtempSync(`${tmpdir()}/opencode-claude-smoke-cfg-`);
   const { buildClaudeCodeChildEnv } = await import("../src/auth-env.ts");
   const {
     interpretClaudeAuthStatus,
@@ -154,7 +158,7 @@ async function main() {
   // Code Mode catalog: only that section of OpenCode's system prompt is kept
   {
     const { codeModeCatalog } = await import("../src/request-kind.ts");
-    const system = "You are an AI agent running in OpenCode.\n\n# Your Model\nclaude-code\n\n# Code Mode\n\nUse the `execute` tool to call the tools listed below.\n\n## Available tools\ntools.openchamber - Control OpenChamber\n\n# Skills\nfoo";
+    const system = "You are an AI agent running in OpenCode.\n\n# Your Model\nclaude-code\n\n# Code Mode\n\nUse the `execute` tool to call the tools listed below.\n\n## Available tools\n\n- openchamber (1 tool)\n  - tools.openchamber.read({ path: string }): Promise<string> // Read\n\n# Skills\nfoo";
     const catalog = codeModeCatalog([{ role: "system", content: system }, { role: "user", content: "hi" }]);
     assert.match(catalog, /^# Code Mode/);
     assert.match(catalog, /tools\.openchamber/);
@@ -1353,8 +1357,10 @@ async function main() {
     } as any);
     assert.deepEqual(teardownSessionBridges("ses_other"), []);
     assert.deepEqual(teardownSessionBridges("ses_aborted"), ["ses_aborted"]);
-    assert.equal(closed, true);
+    // Leaves the pool at once; the process closes after the stop settles.
     assert.equal(getBridge("abort-test"), undefined);
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(closed, true);
   }
 
   // Evicting one OpenCode location must not stop the proxy another still uses
@@ -1463,7 +1469,7 @@ async function main() {
       // Utility turns get a one-line prompt that names the host
       assert.match(
         String(titleOptions!.systemPrompt),
-        /^You are a text generation helper running in OpenChamber through the Claude Code harness\./,
+        /^You are a text generation helper running in OpenCode through the Claude Code harness\./,
       );
       assert.match(String(titleOptions!.prompt), /<request>\nExplain how binary search trees work\n<\/request>/);
     } finally {
@@ -1604,7 +1610,7 @@ async function main() {
       __resetRateLimitNoteDedupe();
 
       // Proxy + mock SDK: successful turn streams text, note, usage — and the
-      // todowrite alias + plan-persistence prompt reach the query starter.
+      // Tool aliases and the tool note reach the query starter.
       __resetRateLimitNoteDedupe();
       let seenParams: Record<string, unknown> | null = null;
       setClaudeQueryStarter(async (params) => {
@@ -1709,19 +1715,20 @@ async function main() {
       assert.match(okReasoning, /99%/);
       assert.equal(okJson.usage?.prompt_tokens, 11);
 
-      // Query starter received the todo alias + plan-persistence append
+      // Query starter received the aliases and the tool note
       assert.ok(seenParams, "query starter params captured");
       assert.equal(seenParams.cwd, "/data/projects/infra");
       const aliases = (seenParams as { toolAliases?: Record<string, string> })
         .toolAliases;
-      assert.equal(aliases?.TodoWrite, "mcp__opencode__todowrite");
+      // OpenCode 2 has no todo tools; no Claude Code todo alias or plan nag.
+      assert.equal(aliases?.TodoWrite, undefined);
       assert.equal(aliases?.todowrite, "mcp__opencode__todowrite");
       const sysPrompt = seenParams.systemPrompt as {
         append?: string;
         snapshot?: boolean;
         excludeDynamicSections?: boolean;
       };
-      assert.match(sysPrompt.append ?? "", /mcp__opencode__todowrite/);
+      assert.doesNotMatch(sysPrompt.append ?? "", /todowrite/);
       assert.match(sysPrompt.append ?? "", /[Bb]atch independent tool calls/);
       assert.equal(sysPrompt.snapshot, true);
       assert.equal(sysPrompt.excludeDynamicSections, true);
@@ -1762,7 +1769,7 @@ async function main() {
 
       assert.match(
         sysPrompt.append ?? "",
-        /^<runtime_info>In case you're asked: you are running in OpenChamber through the Claude Code harness/,
+        /^<runtime_info>In case you're asked: you are running in OpenCode through the Claude Code harness/,
       );
       assert.equal((seenParams.systemPrompt as { preset?: string }).preset, "claude_code");
 
@@ -2054,12 +2061,13 @@ async function main() {
       clearForeignSessionId,
       findClaudeSessionFile,
       getForeignSessionId,
+      getSessionLeafUuid,
       setForeignSessionId,
     } = await import("../src/session-store.ts");
     const { mkdirSync, rmSync, writeFileSync, mkdtempSync } = await import(
       "node:fs"
     );
-    const { homedir, tmpdir } = await import("node:os");
+    const { tmpdir } = await import("node:os");
     const { join: joinPath } = await import("node:path");
 
     // Isolate the rate-limit store: this block mocks healthy turns, so a
@@ -2142,8 +2150,7 @@ async function main() {
 
       // 2. Stored binding whose transcript file EXISTS → resume, no injection
       const fakeProjectsDir = joinPath(
-        homedir(),
-        ".claude",
+        process.env.CLAUDE_CONFIG_DIR!,
         "projects",
         "opencode-claude-smoke",
       );
@@ -2161,6 +2168,94 @@ async function main() {
         String(seen2.params!.prompt ?? ""),
         /<conversation_history>/,
       );
+      assert.equal("resumeSessionAt" in seen2.params!, false);
+
+      // 2b. The turn's main-chain entries become the resume point. When
+      //     another claude process appended a branch after it (an orphaned
+      //     turn closed by the TTL reaper), the resume goes through a fork
+      //     cut at it. Subagent entries don't move it.
+      const { setClaudeSessionForker } = await import("../src/proxy.ts");
+      const forks: string[] = [];
+      setClaudeSessionForker(async (id, at) => {
+        forks.push(`${id}@${at}`);
+        writeFileSync(joinPath(fakeProjectsDir, "mock-sess-fork.jsonl"), '{"type":"assistant","uuid":"f1"}\n');
+        return "mock-sess-fork";
+      });
+      setClaudeQueryStarter(async (params) => {
+        seen2.params = params as unknown as Record<string, unknown>;
+        return {
+          stream: (async function* () {
+            yield { type: "system", subtype: "init", session_id: "mock-sess-live" };
+            yield {
+              type: "assistant",
+              uuid: "leaf-main",
+              session_id: "mock-sess-live",
+              parent_tool_use_id: null,
+              message: { content: [] },
+            };
+            yield {
+              type: "assistant",
+              uuid: "leaf-subagent",
+              session_id: "mock-sess-live",
+              parent_tool_use_id: "toolu_sub",
+              message: { content: [] },
+            };
+            yield {
+              type: "stream_event",
+              event: {
+                type: "content_block_delta",
+                delta: { type: "text_delta", text: "MOCK_OK" },
+              },
+            };
+            yield { type: "result", is_error: false, usage: {} };
+          })(),
+          interrupt: async () => {},
+          close: () => {},
+          getPid: () => null,
+        };
+      });
+      await (await postChat("smoke-history-resume", historyMessages)).text();
+      assert.equal(getSessionLeafUuid("smoke-history-resume"), "leaf-main");
+      writeFileSync(
+        joinPath(fakeProjectsDir, "mock-sess-live.jsonl"),
+        '{"type":"assistant","uuid":"leaf-main"}\n{"type":"user","parentUuid":"leaf-main","uuid":"ours"}\n',
+      );
+      mockTurn(seen2, "mock-sess-live");
+      await (await postChat("smoke-history-resume", historyMessages)).text();
+      assert.equal(seen2.params!.resume, "mock-sess-live");
+      assert.deepEqual(forks, [], "a chain that continues from the leaf resumes as is");
+      writeFileSync(
+        joinPath(fakeProjectsDir, "mock-sess-live.jsonl"),
+        '{"type":"assistant","uuid":"leaf-main"}\n{"type":"user","parentUuid":"old-point","uuid":"stale-branch"}\n',
+      );
+      mockTurn(seen2, "mock-sess-fork");
+      await (await postChat("smoke-history-resume", historyMessages)).text();
+      assert.deepEqual(forks, ["mock-sess-live@leaf-main"]);
+      assert.equal(seen2.params!.resume, "mock-sess-fork");
+      assert.equal(getForeignSessionId("smoke-history-resume"), "mock-sess-fork");
+      assert.equal(getSessionLeafUuid("smoke-history-resume"), "f1");
+      // A leaf the file no longer holds falls back to a plain resume.
+      writeFileSync(joinPath(fakeProjectsDir, "mock-sess-live.jsonl"), "{}\n");
+      setForeignSessionId("smoke-history-noleaf", "mock-sess-live", { leafUuid: "gone" });
+      mockTurn(seen2, "mock-sess-live");
+      await (await postChat("smoke-history-noleaf", historyMessages)).text();
+      assert.equal(seen2.params!.resume, "mock-sess-live");
+      assert.equal(forks.length, 1);
+      // A fork that fails transfers the history instead of retrying.
+      writeFileSync(
+        joinPath(fakeProjectsDir, "mock-sess-live.jsonl"),
+        '{"type":"assistant","uuid":"leaf-main"}\n{"type":"user","parentUuid":"old-point","uuid":"stale-branch"}\n',
+      );
+      setForeignSessionId("smoke-history-forkfail", "mock-sess-live", { leafUuid: "leaf-main" });
+      setClaudeSessionForker(async () => {
+        throw new Error("fork failed");
+      });
+      mockTurn(seen2, null);
+      await (await postChat("smoke-history-forkfail", historyMessages)).text();
+      assert.equal(seen2.params!.resume, undefined);
+      assert.match(String(seen2.params!.prompt ?? ""), /<conversation_history>/);
+      assert.equal(getForeignSessionId("smoke-history-forkfail"), undefined);
+      setClaudeSessionForker(null);
       rmSync(fakeProjectsDir, { recursive: true, force: true });
 
       // 3. Stored binding with a MISSING transcript file → binding dropped,
