@@ -9,6 +9,7 @@
  * timers to keep the process alive.
  */
 import { createHash } from "node:crypto";
+import { mcpToolName } from "./host.js";
 
 export const DEFAULT_STORE_MB = 16;
 const MAX_ENTRY_BYTES = 4 * 1024 * 1024;
@@ -145,7 +146,7 @@ export function formatSlice(id: string, result: SliceResult): string {
   if (!result.ok) return result.reason;
   const more =
     result.end < result.total
-      ? `; next: output_slice(id="${id}", offset=${result.end})`
+      ? `; next: ${mcpToolName("output_slice")}(id="${id}", offset=${result.end})`
       : "; end of output";
   return `[output ${id}: chars ${result.offset}-${result.end} of ${result.total}${more}]\n${result.text}`;
 }

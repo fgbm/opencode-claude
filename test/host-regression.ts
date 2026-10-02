@@ -19,6 +19,13 @@ assert.equal(mcpToolName("read", plain), "mcp__opencode__read");
 assert.equal(openCodeToolName("mcp__openchamber__edit"), "edit");
 assert.equal(openCodeToolName("mcp__opencode__edit"), "edit");
 
+// The rule "never cut a live read" matches the call under either name; keyed
+// to one bridge name it silently stopped applying on the other host.
+const { isFileReadTool } = await import("../src/spill.ts");
+assert.equal(isFileReadTool("mcp__openchamber__read"), true);
+assert.equal(isFileReadTool("mcp__opencode__read"), true);
+assert.equal(isFileReadTool("mcp__openchamber__bash"), false);
+
 // The runtime note names the host this process runs under.
 delete process.env.OPENCHAMBER_RUNTIME;
 const { buildRuntimeInstructions } = await import("../src/prompt.ts");

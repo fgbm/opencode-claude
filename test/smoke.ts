@@ -862,7 +862,11 @@ async function main() {
       const slice = store.slice(id!, 400, 100);
       assert.ok(slice.ok);
       assert.ok(slice.ok && slice.text.startsWith(middle));
-      assert.match(formatSlice(id!, slice), /chars 400-500 of \d+; next: output_slice/);
+      // The tool is named after the host, so the note names it that way too.
+      assert.match(
+        formatSlice(id!, slice),
+        /chars 400-500 of \d+; next: mcp__(?:openchamber|opencode)__output_slice/,
+      );
       // a slice never exceeds the per-call cap
       const whole = store.slice(id!, 0, 1_000_000);
       assert.ok(whole.ok && whole.text.length === 8000);

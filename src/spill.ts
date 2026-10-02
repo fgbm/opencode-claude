@@ -5,6 +5,7 @@
  * note tells the model how to read the middle with `output_slice`. Nothing is
  * written to disk. Disable with OPENCODE_CLAUDE_SPILL_CHARS=0.
  */
+import { mcpToolName, openCodeToolName } from "./host.js";
 import type { OutputStore } from "./output-store.js";
 
 /** Shell dumps in measured sessions clustered around 11–20k chars. */
@@ -34,7 +35,9 @@ const FILE_READ_TOOLS = new Set(["read"]);
 
 export function isFileReadTool(name: string | undefined): boolean {
   if (!name) return false;
-  return FILE_READ_TOOLS.has(name.replace(/^mcp__opencode__/, "").toLowerCase());
+  // The bridge is named after the host, so a read arrives as
+  // mcp__opencode__read or mcp__openchamber__read.
+  return FILE_READ_TOOLS.has(openCodeToolName(name).toLowerCase());
 }
 
 function readPathOf(argumentsJson: string | undefined): string | undefined {
@@ -107,7 +110,7 @@ export function presentLargeOutput(
     "tail:",
     text.slice(-SPILL_TAIL),
     id
-      ? `To read the middle, call output_slice(id="${id}", offset=${SPILL_HEAD}). It is kept in memory for about 30 minutes; after that, re-run the command narrowed (grep, head, sed -n).`
+      ? `To read the middle, call ${mcpToolName("output_slice")}(id="${id}", offset=${SPILL_HEAD}). It is kept in memory for about 30 minutes; after that, re-run the command narrowed (grep, head, sed -n).`
       : "The middle is not saved anywhere. To see it, re-run the command narrowed (grep, head, sed -n).",
   ].join("\n");
   if (note.length >= text.length) return { text, spilledChars: 0 };
