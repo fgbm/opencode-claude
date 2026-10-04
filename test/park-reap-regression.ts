@@ -102,6 +102,7 @@ async function main() {
     assert.match(rebuilt, /<tool_results>/);
     assert.match(rebuilt, /LATE-RESULT/);
     assert.match(rebuilt, /Continue the task/);
+    assert.match(rebuilt, /not from the user/, "the interruption isn't blamed on the user");
 
     // stopProxy closes parks that are still waiting.
     delete process.env.OPENCODE_CLAUDE_PARKED_TURN_TTL_MS;

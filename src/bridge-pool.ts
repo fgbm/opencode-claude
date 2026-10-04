@@ -33,7 +33,28 @@ export type ParkedBridge = {
   continueStream?: () => AsyncGenerator<unknown, void, unknown>;
 };
 
-const bridges = new Map<string, ParkedBridge>();
+/**
+ * Turns live in the process, not in a copy of this module. OpenCode reloads
+ * a plugin by importing a fresh copy and unloading the old one, and loads
+ * one copy per location; a parked turn must survive that and be resumed by
+ * whichever copy receives its tool results.
+ */
+type BridgeRuntime = {
+  bridges: Map<string, ParkedBridge>;
+  stopping: Map<string, Set<Promise<void>>>;
+  /** Plugin instances holding the proxy, across every copy of the module. */
+  holders: number;
+  /** Stop of every turn scheduled after the last instance released. */
+  shutdownTimer?: ReturnType<typeof setTimeout>;
+};
+
+const RUNTIME_KEY = Symbol.for("@openchamber/opencode-claude/bridge-runtime/v1");
+
+export const bridgeRuntime: BridgeRuntime = ((globalThis as Record<symbol, unknown>)[
+  RUNTIME_KEY
+] ??= { bridges: new Map(), stopping: new Map(), holders: 0 }) as BridgeRuntime;
+
+const bridges = bridgeRuntime.bridges;
 
 export function putBridge(bridge: ParkedBridge): void {
   // One active bridge per conversation. Callers stop the previous turn
@@ -119,7 +140,7 @@ export function stopBridge(id: string, reason = "Bridge closed"): Promise<void> 
 }
 
 /** Stops started for a conversation that have not closed their process yet. */
-const stopping = new Map<string, Set<Promise<void>>>();
+const stopping = bridgeRuntime.stopping;
 
 /**
  * Stop every turn of a conversation, including stops already running in the

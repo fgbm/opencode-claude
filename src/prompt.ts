@@ -751,7 +751,7 @@ export function answeredToolStepPrompt(
     text:
       userBlocks.length > 0
         ? "</tool_results>\n\nThe user sent the following after those calls. Respond to it with the results in mind:"
-        : "</tool_results>\n\nContinue the task from these results.",
+        : "</tool_results>\n\nIf your session shows these calls as rejected, or the request as interrupted by the user, that came from the plugin (a reload, or a wait that timed out), not from the user: nobody asked you to stop. Continue the task from these results.",
   });
   content.push(...userBlocks);
   return {
