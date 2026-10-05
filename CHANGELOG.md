@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.3.6 - 2026-10-05
+
+- **Fix: session titles named an unrelated project**: Claude Code adds your
+  saved memory notes to every request, including the one that names a new
+  session, so a title could pick up a project from those notes instead of
+  your message. Titles and text-only summaries now run without the notes.
+  Chat turns, and summaries that continue the chat's Claude session, keep
+  them.
+
 ## 1.3.5 - 2026-10-05
 
 - **Compaction summaries cover the whole chat**: summaries used to be written
