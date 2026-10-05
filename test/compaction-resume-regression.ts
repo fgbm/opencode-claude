@@ -112,6 +112,7 @@ async function main() {
     assert.equal(params.permissionMode, "dontAsk", "tool calls are refused");
     assert.equal(params.allowedTools, undefined);
     assert.equal(params.autoCompactEnabled, false);
+    assert.equal(params.env?.CLAUDE_CODE_DISABLE_AUTO_MEMORY, undefined, "keeps the chat's memory");
     const text = await promptText(params.prompt);
     assert.ok(text.includes(SUMMARY_PROMPT));
     assert.ok(!text.includes("<conversation_history>"), "no text copy of the chat");
@@ -140,6 +141,7 @@ async function main() {
     const params = await summarize("other", [...older, user(SUMMARY_PROMPT)]);
     assert.equal(params.resume, undefined);
     assert.equal(params.model, chatParams!.model);
+    assert.equal(params.env?.CLAUDE_CODE_DISABLE_AUTO_MEMORY, "1", "no memory in a text-copy summary");
     const text = await promptText(params.prompt);
     assert.ok(text.includes("<conversation_history>"));
     assert.ok(text.includes("answer L2"));

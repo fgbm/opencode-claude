@@ -1068,16 +1068,20 @@ async function main() {
     );
     const switched: unknown[] = [];
     setModelFallbackHandler((...args) => switched.push(args));
-    setClaudeQueryStarter(async () => ({
-      stream: (async function* () {
-        yield { type: "system", subtype: "model_refusal_fallback", scope: "session", original_model: "claude-fable-5-1[1m]", fallback_model: "claude-opus-5", api_refusal_category: "bio" };
-        yield { type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "answer from opus" } } };
-        yield { type: "result", is_error: false, usage: {} };
-      })(),
-      interrupt: async () => {},
-      close: () => {},
-      getPid: () => null,
-    }));
+    let chatEnv: Record<string, unknown> | undefined;
+    setClaudeQueryStarter(async (params) => {
+      chatEnv = params.env as Record<string, unknown>;
+      return {
+        stream: (async function* () {
+          yield { type: "system", subtype: "model_refusal_fallback", scope: "session", original_model: "claude-fable-5-1[1m]", fallback_model: "claude-opus-5", api_refusal_category: "bio" };
+          yield { type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "answer from opus" } } };
+          yield { type: "result", is_error: false, usage: {} };
+        })(),
+        interrupt: async () => {},
+        close: () => {},
+        getPid: () => null,
+      };
+    });
     await startProxy();
     const res = await fetch(getClaudeProxyBaseUrl() + "/chat/completions", {
       method: "POST",
@@ -1088,6 +1092,8 @@ async function main() {
     assert.match(body, /declined this request/);
     assert.match(body, /answer from opus/);
     assert.deepEqual(switched, [["ses_fallback", "claude-opus-5[1m]", undefined]]);
+    // Chat turns keep the user's Claude Code memory; only utility turns drop it.
+    assert.equal(chatEnv?.CLAUDE_CODE_DISABLE_AUTO_MEMORY, undefined);
     setModelFallbackHandler(null);
     setClaudeQueryStarter(null);
   }
@@ -1204,6 +1210,10 @@ async function main() {
       );
       assert.deepEqual(titleOptions!.tools, []);
       assert.deepEqual(titleOptions!.settingSources, []);
+      assert.equal(
+        (titleOptions!.env as Record<string, unknown>).CLAUDE_CODE_DISABLE_AUTO_MEMORY,
+        "1",
+      );
       assert.deepEqual(titleOptions!.skills, []);
       assert.equal(titleOptions!.maxTurns, 1);
       assert.equal(titleOptions!.model, "claude-haiku-4-5");

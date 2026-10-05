@@ -1017,6 +1017,11 @@ async function startNewTurn(input: {
   // A resumed summary repeats the tools of the chat turn it continues.
   const openCodeTools = summaryResume?.profile?.tools ?? requestTools;
   const isMetaRequest = metaKind !== null;
+  // Claude Code adds the user's auto-memory index to every turn, even with
+  // no setting sources. In a utility turn it leaks into the output: a title
+  // came back naming an unrelated project from a memory line. A summary that
+  // resumes the chat's session keeps it, like the chat turn it continues.
+  if (isMetaRequest && !summaryResume) env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
   const requestDirectory = req.headers.get(DIRECTORY_HEADER)?.trim();
   const cwd =
     process.env.OPENCODE_CLAUDE_CWD || requestDirectory || process.cwd();
