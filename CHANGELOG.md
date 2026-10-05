@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.7 - 2026-10-05
+
+- **Fix: Claude missed what another model said in the same chat**: if you
+  switched a chat to another model for a few turns and then back to Claude,
+  Claude continued from its own last turn and never saw those turns. It
+  could answer an older question or do the wrong task. Now Claude gets the
+  turns it missed along with your new message.
+
 ## 1.3.6 - 2026-10-05
 
 - **Fix: session titles named an unrelated project**: Claude Code adds your
