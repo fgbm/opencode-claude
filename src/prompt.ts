@@ -410,7 +410,26 @@ const SYSTEM_REMINDER_BLOCK = /<system-reminder>[\s\S]*?<\/system-reminder>/g;
 export function userHistoryFingerprints(
   messages: Array<{ role?: string; content?: unknown }>,
 ): string[] {
-  const prints: string[] = [];
+  return fingerprintedUserMessages(messages).map((entry) => entry.print);
+}
+
+/**
+ * The part of a history after its first `count` fingerprinted user
+ * messages, starting at the next one: what came after a turn boundary of
+ * `count` user messages. Empty when the history holds no more than that.
+ */
+export function historyAfterUserCount<T extends { role?: string; content?: unknown }>(
+  messages: T[],
+  count: number,
+): T[] {
+  const next = fingerprintedUserMessages(messages)[count];
+  return next ? messages.slice(next.index) : [];
+}
+
+function fingerprintedUserMessages(
+  messages: Array<{ role?: string; content?: unknown }>,
+): Array<{ index: number; print: string }> {
+  const entries: Array<{ index: number; print: string }> = [];
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
     if (msg?.role !== "user" || isSyntheticToolMediaMessage(msg, messages[i - 1])) continue;
@@ -420,9 +439,9 @@ export function userHistoryFingerprints(
       .trim();
     const identity = text || (contentHasAttachments(msg.content) ? "\u0000attachments" : "");
     if (!identity) continue;
-    prints.push(createHash("sha1").update(identity).digest("hex").slice(0, 16));
+    entries.push({ index: i, print: createHash("sha1").update(identity).digest("hex").slice(0, 16) });
   }
-  return prints;
+  return entries;
 }
 
 export function contentHasAttachments(content: unknown): boolean {
@@ -914,19 +933,29 @@ export function buildConversationTranscript(
  * Prepend a transferred-history block to a prompt. Text prompts get a plain
  * prefix; multimodal prompts get an extra leading text block so attachments
  * still reach Claude.
+ *
+ * `missed` marks a transcript of only the turns a resumed session never saw
+ * (another model answered them, or they failed before Claude ran).
  */
 export function withConversationContext(
   prompt: string | SdkUserPrompt,
   transcript: string,
+  missed = false,
 ): string | SdkUserPrompt {
   const body = transcript.trim();
   if (!body) return prompt;
+  const intro = missed
+    ? "These messages were added to this chat after your last turn, without you " +
+      "(for example, the user switched to another model for them). Treat them as part " +
+      "of the conversation — do not re-do completed work — and respond to the user's " +
+      "latest message, which follows them.\n\n"
+    : "The earlier conversation of this chat is included below because the previous " +
+      "Claude session could not be resumed. Treat it as established context — do not " +
+      "re-do completed work — and respond to the user's latest message, which follows " +
+      "the history.\n\n";
   const prefix =
     "<conversation_history>\n" +
-    "The earlier conversation of this chat is included below because the previous " +
-    "Claude session could not be resumed. Treat it as established context — do not " +
-    "re-do completed work — and respond to the user's latest message, which follows " +
-    "the history.\n\n" +
+    intro +
     body +
     "\n</conversation_history>\n\nLatest user message:\n";
   if (typeof prompt === "string") {

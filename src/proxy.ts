@@ -89,6 +89,7 @@ import {
   latestUserPrompt,
   openaiToolResultToMcpContent,
   priorMessagesOf,
+  historyAfterUserCount,
   promptAsStream,
   userHistoryFingerprints,
   withConversationContext,
@@ -1194,11 +1195,19 @@ async function startNewTurn(input: {
   // Where the resume has to be cut through a fork (see below): the session
   // to copy and the entry to cut at.
   let forkAt: { sessionId: string; leafUuid: string } | undefined;
+  // Turns after this chat's last Claude turn that the session never saw:
+  // the user switched to another model for them, or they failed before
+  // Claude ran. A resume alone would skip them.
+  let missedMessages: typeof priorMessages = [];
   if (resume && sessionFile && !isMetaRequest) {
     const match = matchTurnHistory(
       getSessionTurns(conversationKey),
       userHistoryFingerprints(priorMessages),
     );
+    // A rebuilt tool step continues Claude's own turn, which it saw.
+    if (match.kind === "latest" && answeredStep === null) {
+      missedMessages = historyAfterUserCount(priorMessages, match.count);
+    }
     // A boundary may sit in an earlier session of this chat (before a
     // fork); its file must still hold the leaf.
     const source = match.kind === "rewind" ? (match.sessionId ?? resume) : undefined;
@@ -1308,19 +1317,25 @@ async function startNewTurn(input: {
   // messages into the prompt so Claude sees the whole conversation.
   // A summary that can't resume gets the history sized to the chat model's
   // window: OpenCode already fit the request to it.
+  // A resumed session gets only the turns it missed, if any.
   const transcript = resume
-    ? ""
+    ? buildConversationTranscript(missedMessages)
     : metaKind === "summary"
       ? buildConversationTranscript(priorMessages, summaryHistoryMaxChars(model))
       : buildConversationTranscript(priorMessages);
   if (transcript) {
-    log.info("[opencode-claude] injecting transferred conversation history", {
-      conversationKey,
-      transcriptChars: transcript.length,
-      historyMessages: priorMessages.length,
-    });
+    log.info(
+      resume
+        ? "[opencode-claude] injecting turns the resumed Claude session missed"
+        : "[opencode-claude] injecting transferred conversation history",
+      {
+        conversationKey,
+        transcriptChars: transcript.length,
+        historyMessages: resume ? missedMessages.length : priorMessages.length,
+      },
+    );
   }
-  const contextualPrompt = withConversationContext(prompt, transcript);
+  const contextualPrompt = withConversationContext(prompt, transcript, Boolean(resume));
 
   const mcpServers =
     (!isMetaRequest || summaryResume) && openCodeTools.length > 0

@@ -258,7 +258,7 @@ export function rewindSessionTurns(conversationKey: string, index: number): void
 
 export type TurnHistoryMatch =
   | { kind: "untracked" }
-  | { kind: "latest" }
+  | { kind: "latest"; count: number }
   | { kind: "rewind"; index: number; leafUuid?: string; sessionId?: string }
   | { kind: "diverged" };
 
@@ -266,8 +266,9 @@ export type TurnHistoryMatch =
  * Compare the OpenCode history before a new prompt (as fingerprints) with
  * the boundaries a binding recorded.
  * - latest: the history still holds the newest boundary's user messages
- *   (more may follow: the prompt of a turn that failed before Claude ran,
- *   a steering message). Resume as usual.
+ *   (more may follow: turns another model answered, the prompt of a turn
+ *   that failed before Claude ran). Resume as usual; `count` is the
+ *   boundary's size, so the caller can hand Claude what came after it.
  * - rewind: the history ends exactly at an earlier boundary, so the turns
  *   after it were reverted or edited away.
  * - diverged: nothing lines up; the session holds a history OpenCode no
@@ -282,7 +283,7 @@ export function matchTurnHistory(
   if (!latest) return { kind: "untracked" };
   const n = prints.length;
   if (n >= latest.count && prints[latest.count - 1] === latest.hash) {
-    return { kind: "latest" };
+    return { kind: "latest", count: latest.count };
   }
   for (let i = turns.length - 2; i >= 0; i--) {
     const turn = turns[i]!;
