@@ -667,7 +667,6 @@ type ClaudeSystemPrompt = {
   type: "preset";
   preset: "claude_code";
   append?: string;
-  snapshot?: boolean;
   excludeDynamicSections?: boolean;
 };
 
@@ -1558,12 +1557,11 @@ async function startNewTurn(input: {
       ? [`# Project instructions (loaded by ${currentHost().name})\n\n${instructionFiles}`]
       : []),
   ].join("\n\n");
-  // The cache flags live in the stored profile too: a summary that resumes
+  // The cache flag lives in the stored profile too: a summary that resumes
   // the chat repeats this prompt as-is and reads the chat from the cache.
   const chatSystemPrompt: ClaudeSystemPrompt = {
     type: "preset",
     preset: "claude_code",
-    snapshot: true,
     ...(excludeDynamicSections() ? { excludeDynamicSections: true } : {}),
     append: systemAppend,
   };

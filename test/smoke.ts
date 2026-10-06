@@ -1718,12 +1718,10 @@ async function main() {
       assert.equal(aliases?.todowrite, "mcp__opencode__todowrite");
       const sysPrompt = seenParams.systemPrompt as {
         append?: string;
-        snapshot?: boolean;
         excludeDynamicSections?: boolean;
       };
       assert.doesNotMatch(sysPrompt.append ?? "", /todowrite/);
       assert.match(sysPrompt.append ?? "", /[Bb]atch independent tool calls/);
-      assert.equal(sysPrompt.snapshot, true);
       assert.equal(sysPrompt.excludeDynamicSections, true);
 
       // Bridged tools register in a stable order for the cached prefix.

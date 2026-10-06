@@ -108,9 +108,8 @@ async function main() {
     assert.equal(params.persistSession, false, "nothing written to the session");
     assert.equal(params.model, chatParams!.model, "the chat's model, not haiku");
     assert.deepEqual(params.systemPrompt, chatParams!.systemPrompt, "same system prompt as the chat turn");
-    // The cache flags ride along: without them the summary's prefix differs
+    // The cache flag rides along: without it the summary's prefix differs
     // from the chat's and the cache read this resume is for never happens.
-    assert.equal((params.systemPrompt as { snapshot?: boolean }).snapshot, true);
     assert.equal(
       (params.systemPrompt as { excludeDynamicSections?: boolean }).excludeDynamicSections,
       true,
