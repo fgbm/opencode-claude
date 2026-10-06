@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.3.8 - 2026-10-07
+
+- **New sessions start from the prompt cache**: Claude Code's system prompt
+  carried the working directory, memory path and git status, so every new
+  chat and every subagent wrote all of it to the cache again. Those details
+  now go in the first message instead, and a new session reads the prompt
+  from the cache. Already open chats rewrite their cache once after the
+  update. `OPENCODE_CLAUDE_DYNAMIC_SECTIONS=keep` restores the old layout.
+  Thanks to @fgbm.
+- **Fix: long chats compacted too early**: when one turn made several calls
+  inside Claude Code, the plugin added up their prompts, and OpenCode read
+  the sum as the context size. A 1M chat at 500k could compact right away.
+  Now the context size is the last call's prompt. Thanks to @android6.
+- **Fix: instructions imported into CLAUDE.md arrived twice**: when a
+  CLAUDE.md pulled in a file with `@path` (for example the global
+  `~/.config/opencode/AGENTS.md`), Claude Code loaded it and the plugin sent
+  it again. Imported files now count as already loaded. Thanks to
+  @android6.
+
 ## 1.3.7 - 2026-10-05
 
 - **Fix: Claude missed what another model said in the same chat**: if you
