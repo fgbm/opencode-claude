@@ -1517,6 +1517,9 @@ async function startNewTurn(input: {
           systemPrompt: summaryResume.profile?.systemPrompt ?? {
             type: "preset",
             preset: "claude_code",
+            // The chat's session was started without the dynamic sections in
+            // its system prompt; repeating them here would add them twice.
+            ...(excludeDynamicSections() ? { excludeDynamicSections: true } : {}),
             append: buildRuntimeInstructions(),
           },
         }
