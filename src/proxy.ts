@@ -582,7 +582,24 @@ function selectionFromRequest(
 
 const META_REQUEST_MODEL = "claude-haiku-4-5";
 
-type ClaudeSystemPrompt = { type: "preset"; preset: "claude_code"; append?: string };
+type ClaudeSystemPrompt = {
+  type: "preset";
+  preset: "claude_code";
+  append?: string;
+  excludeDynamicSections?: boolean;
+};
+
+/**
+ * Claude Code puts the working directory, memory path and git status into its
+ * system prompt, so no two sessions share it and every new session (each
+ * subagent too) writes the whole prompt to the cache again. Without them the
+ * prompt is the same everywhere and a new session reads it from the cache;
+ * Claude Code passes them in the first user message instead.
+ * OPENCODE_CLAUDE_DYNAMIC_SECTIONS=keep restores the old layout.
+ */
+function excludeDynamicSections(): boolean {
+  return (process.env.OPENCODE_CLAUDE_DYNAMIC_SECTIONS ?? "").trim().toLowerCase() !== "keep";
+}
 
 /** What a chat's last turn sent Claude, so its summary can hit the same cache. */
 type ChatTurnProfile = {
@@ -1421,9 +1438,12 @@ async function startNewTurn(input: {
   const agentPrompt = customAgentPrompt(messages);
   const instructionFiles = isMetaRequest ? "" : openCodeInstructionFiles(messages, cwd);
   const mcpNotes = openCodeToolNames.includes("execute") ? mcpInstructions(messages) : "";
+  // Stored in the chat's profile below, so a summary that resumes the chat
+  // repeats the same prompt, flag included, and still reads from the cache.
   const chatSystemPrompt: ClaudeSystemPrompt = {
     type: "preset",
     preset: "claude_code",
+    ...(excludeDynamicSections() ? { excludeDynamicSections: true } : {}),
     append: [
       buildRuntimeInstructions(),
       ...(agentPrompt
@@ -1497,6 +1517,9 @@ async function startNewTurn(input: {
           systemPrompt: summaryResume.profile?.systemPrompt ?? {
             type: "preset",
             preset: "claude_code",
+            // The chat's session was started without the dynamic sections in
+            // its system prompt; repeating them here would add them twice.
+            ...(excludeDynamicSections() ? { excludeDynamicSections: true } : {}),
             append: buildRuntimeInstructions(),
           },
         }
