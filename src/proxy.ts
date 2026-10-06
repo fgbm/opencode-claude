@@ -12,6 +12,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { currentHost, mcpToolName, openCodeToolName } from "./host.js";
 import { mcpInstructions, openCodeInstructionFiles } from "./opencode-context.js";
 import {
+  bridgeRuntime,
   clearAllBridges,
   deleteBridge,
   findBridgeByConversation,
@@ -90,6 +91,7 @@ import {
   latestUserPrompt,
   openaiToolResultToMcpContent,
   priorMessagesOf,
+  historyAfterUserCount,
   promptAsStream,
   userHistoryFingerprints,
   withConversationContext,
@@ -320,65 +322,8 @@ function usageSections(
   };
 }
 
-/**
- * OpenCode 2 imports the plugin module once per location, so module-level
- * state is not process-wide: every location used to bind its own listener.
- * The runtime lives on `globalThis`, so all locations in the process share
- * one proxy. `stopOwner` belongs to the module copy whose `handleRequest`
- * serves the listener: its bridge pool holds the parked turns.
- */
-type ProxyRuntime = {
-  server: ReturnType<typeof Bun.serve> | null;
-  port: number | null;
-  users: number;
-  stopOwner: (() => void | Promise<void>) | null;
-  /** The owner's teardown for one session's parked turns (same pool). */
-  teardownOwnerSession: ((sessionID: string) => string[]) | null;
-};
-
-const SHARED_PROXY_KEY = Symbol.for("opencode-claude.proxy.runtime");
-
-function sharedProxyRuntime(): ProxyRuntime {
-  const store = globalThis as typeof globalThis & {
-    [SHARED_PROXY_KEY]?: ProxyRuntime;
-  };
-  return (store[SHARED_PROXY_KEY] ??= {
-    server: null,
-    port: null,
-    users: 0,
-    stopOwner: null,
-    teardownOwnerSession: null,
-  });
-}
-
-function teardownLocalSession(sessionID: string): string[] {
-  const tornDown: string[] = [];
-  for (const kind of [null, "title", "summary"] as const) {
-    const key = requestKeyNamespace(kind) + sessionID;
-    const bridge = findBridgeByConversation(key);
-    if (!bridge) continue;
-    log.info("[opencode-claude] session stopped with a live bridge, closing it", {
-      conversationKey: key,
-      pending: bridge.pendingTools.size,
-    });
-    // Graceful: interrupt the CLI so its last events still land, then close.
-    void stopBridge(bridge.id, "Session stopped");
-    tornDown.push(key);
-  }
-  return tornDown;
-}
-
-/**
- * Close the turns still live for a session OpenCode reports idle. An abort
- * while a turn is parked on a tool leaves no open request whose cancel()
- * could clean up, so the CLI child would otherwise wait out the park TTL.
- * Normal turns delete their bridge before idle, so this is a no-op for them.
- * Returns the conversation keys that were closed.
- */
-export function teardownSessionBridges(sessionID: string): string[] {
-  const owner = sharedProxyRuntime().teardownOwnerSession ?? teardownLocalSession;
-  return owner(sessionID);
-}
+let server: ReturnType<typeof Bun.serve> | null = null;
+let proxyPort: number | null = null;
 
 /** Injectable for smoke tests — production path always uses startClaudeQuery. */
 let queryStarter: typeof startClaudeQuery = startClaudeQuery;
@@ -399,8 +344,7 @@ export function setClaudeSessionForker(
 }
 
 export function getClaudeProxyBaseUrl(): string {
-  const port =
-    sharedProxyRuntime().port ?? (REQUESTED_PROXY_PORT > 0 ? REQUESTED_PROXY_PORT : null);
+  const port = proxyPort ?? (REQUESTED_PROXY_PORT > 0 ? REQUESTED_PROXY_PORT : null);
   if (!port) {
     throw new Error(
       "Claude proxy is not listening yet — call startProxy() before getClaudeProxyBaseUrl()",
@@ -410,7 +354,7 @@ export function getClaudeProxyBaseUrl(): string {
 }
 
 export function getProxyPort(): number | null {
-  return sharedProxyRuntime().port;
+  return proxyPort;
 }
 
 function isAddrInUseError(err: unknown): boolean {
@@ -451,16 +395,15 @@ async function isProxyHealthyAt(baseUrl: string): Promise<boolean> {
 }
 
 export async function startProxy(): Promise<number> {
-  const runtime = sharedProxyRuntime();
-  if (runtime.server && runtime.port) return runtime.port;
+  if (server && proxyPort) return proxyPort;
 
   // Only reuse a sibling listener when the operator pinned a port.
   if (REQUESTED_PROXY_PORT > 0) {
     const pinnedUrl = `http://127.0.0.1:${REQUESTED_PROXY_PORT}/v1`;
     if (await isProxyHealthyAt(pinnedUrl)) {
-      runtime.port = REQUESTED_PROXY_PORT;
+      proxyPort = REQUESTED_PROXY_PORT;
       log.info(`[opencode-claude] reusing healthy proxy on ${pinnedUrl}`);
-      return runtime.port;
+      return proxyPort;
     }
   }
 
@@ -468,7 +411,7 @@ export async function startProxy(): Promise<number> {
   const bindPort = REQUESTED_PROXY_PORT; // 0 → ephemeral
 
   try {
-    const server = Bun.serve({
+    server = Bun.serve({
       hostname,
       port: bindPort,
       idleTimeout: PROXY_IDLE_TIMEOUT_SECONDS,
@@ -476,63 +419,93 @@ export async function startProxy(): Promise<number> {
         return handleRequest(req);
       },
     });
-    runtime.server = server;
-    runtime.port = server.port ?? null;
-    // Parked turns each hold a live claude CLI child; nothing resumes them
-    // once the listener is gone.
-    runtime.stopOwner = clearAllBridges;
-    runtime.teardownOwnerSession = teardownLocalSession;
-    if (!runtime.port) {
+    proxyPort = server.port ?? null;
+    if (!proxyPort) {
       throw new Error("Failed to bind Claude proxy to a port");
     }
     log.info(`[opencode-claude] proxy listening on ${getClaudeProxyBaseUrl()}`);
-    return runtime.port;
+    return proxyPort;
   } catch (err) {
     if (
       REQUESTED_PROXY_PORT > 0 &&
       isAddrInUseError(err) &&
       (await isProxyHealthyAt(`http://127.0.0.1:${REQUESTED_PROXY_PORT}/v1`))
     ) {
-      runtime.port = REQUESTED_PROXY_PORT;
+      proxyPort = REQUESTED_PROXY_PORT;
       log.info(
         `[opencode-claude] port ${REQUESTED_PROXY_PORT} in use; reusing existing proxy`,
       );
-      return runtime.port;
+      return proxyPort;
     }
     throw err;
   }
 }
 
 /**
- * Hold the shared proxy for one plugin location. The returned release stops
- * the proxy only when the last location lets go, so unloading one location
- * never kills turns that another location is running.
+ * Every OpenCode location (project) runs its own plugin instance, and
+ * OpenCode tears idle locations down every few minutes and reloads a plugin
+ * by unloading its copy and then importing a fresh one. Instances hold a
+ * reference. A copy stops its own server once none of its instances is left.
+ * Parked turns live in the process (see bridgeRuntime): they are stopped
+ * only a grace period after the last instance of any copy released, so a
+ * reload, whose new copy arrives right after the old one left, picks up a
+ * turn still waiting on a tool instead of killing it.
  */
-export function retainProxy(): () => Promise<void> {
-  const runtime = sharedProxyRuntime();
-  runtime.users++;
-  let released = false;
-  return async () => {
-    if (released) return;
-    released = true;
-    runtime.users = Math.max(0, runtime.users - 1);
-    if (runtime.users === 0) await stopProxy();
-  };
+let proxyHolders = 0;
+
+function reloadGraceMs(): number {
+  const raw = Number(process.env.OPENCODE_CLAUDE_RELOAD_GRACE_MS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 10_000;
 }
 
-/** Stop the process-wide proxy now, whoever else holds it. */
-export async function stopProxy(): Promise<void> {
-  const runtime = sharedProxyRuntime();
-  const stopOwner = runtime.stopOwner ?? clearAllBridges;
-  runtime.stopOwner = null;
-  runtime.teardownOwnerSession = null;
-  // Parked turns each hold a live claude CLI child; nothing resumes them now.
-  await stopOwner();
-  if (runtime.server) {
-    runtime.server.stop(true);
-    runtime.server = null;
-    runtime.port = null;
+export async function acquireProxy(): Promise<number> {
+  proxyHolders += 1;
+  bridgeRuntime.holders += 1;
+  if (bridgeRuntime.shutdownTimer) {
+    clearTimeout(bridgeRuntime.shutdownTimer);
+    bridgeRuntime.shutdownTimer = undefined;
   }
+  return startProxy();
+}
+
+export async function releaseProxy(): Promise<void> {
+  if (proxyHolders === 0) return;
+  proxyHolders -= 1;
+  bridgeRuntime.holders = Math.max(0, bridgeRuntime.holders - 1);
+  // Other copies serve new requests; a response still streaming from this
+  // one finishes first.
+  if (proxyHolders === 0) stopServer(false);
+  if (bridgeRuntime.holders > 0 || bridgeRuntime.shutdownTimer) return;
+  const timer = setTimeout(() => {
+    if (bridgeRuntime.shutdownTimer !== timer) return;
+    bridgeRuntime.shutdownTimer = undefined;
+    if (bridgeRuntime.holders === 0) void clearAllBridges();
+  }, reloadGraceMs());
+  // Never keeps a quitting OpenCode alive.
+  timer.unref?.();
+  bridgeRuntime.shutdownTimer = timer;
+}
+
+export function proxyHolderCount(): number {
+  return proxyHolders;
+}
+
+function stopServer(closeActiveConnections = true): void {
+  if (server) {
+    server.stop(closeActiveConnections);
+    server = null;
+    proxyPort = null;
+  }
+}
+
+export async function stopProxy(): Promise<void> {
+  if (bridgeRuntime.shutdownTimer) {
+    clearTimeout(bridgeRuntime.shutdownTimer);
+    bridgeRuntime.shutdownTimer = undefined;
+  }
+  // Parked turns each hold a live claude CLI child; nothing resumes them now.
+  await clearAllBridges();
+  stopServer();
 }
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
@@ -690,6 +663,89 @@ function selectionFromRequest(
 
 const META_REQUEST_MODEL = "claude-haiku-4-5";
 
+type ClaudeSystemPrompt = {
+  type: "preset";
+  preset: "claude_code";
+  append?: string;
+  snapshot?: boolean;
+  excludeDynamicSections?: boolean;
+};
+
+/** What a chat's last turn sent Claude, so its summary can hit the same cache. */
+type ChatTurnProfile = {
+  systemPrompt: ClaudeSystemPrompt;
+  tools: OpenAITool[];
+  effort?: ClaudeEffort;
+};
+
+const chatTurnProfiles = new Map<string, ChatTurnProfile>();
+const MAX_CHAT_TURN_PROFILES = 64;
+
+/** Where in the chat's Claude session a compaction summary picks up. */
+type SummaryResumePoint = {
+  sessionId: string;
+  /** The entry the summarized part ends at; undefined resumes the whole session. */
+  leafUuid?: string;
+  /** Index of OpenCode's summary prompt in the request. */
+  promptIndex: number;
+  profile?: ChatTurnProfile;
+};
+
+/**
+ * Text budget for a summary that reads the history as text: about three
+ * characters per token of the chat model's window. OpenCode already sized
+ * the request to that window, so this only guards against a runaway one.
+ */
+function summaryHistoryMaxChars(model: string): number {
+  return (/\[1m\]$/i.test(model) ? 1_000_000 : 200_000) * 3;
+}
+
+const SUMMARY_NUDGE_MARKER = "did not fill in the required summary template";
+
+/**
+ * OpenCode summarizes the older part of a chat: the request is that part,
+ * then its summary prompt (plus a reminder after a reply that missed the
+ * template). The chat's Claude session already holds that part with every
+ * tool result in full, so the summary resumes it at the turn boundary where
+ * the part ends. Null when the session can't be cut there (no binding,
+ * history that doesn't line up, a branched transcript): the summary then
+ * reads the history as text.
+ */
+function summaryResumePoint(
+  chatKey: string,
+  messages: OpenAIMessage[],
+): SummaryResumePoint | null {
+  const sessionId = getForeignSessionId(chatKey);
+  if (!sessionId) return null;
+  const users = messages.flatMap((m, i) => (m?.role === "user" ? [i] : []));
+  let promptIndex = users.at(-1);
+  if (promptIndex === undefined) return null;
+  if (
+    users.length > 1 &&
+    extractTextContent(messages[promptIndex]!.content).includes(SUMMARY_NUDGE_MARKER)
+  ) {
+    promptIndex = users.at(-2)!;
+  }
+  const turns = getSessionTurns(chatKey);
+  const prints = userHistoryFingerprints(messages.slice(0, promptIndex));
+  const match = matchTurnHistory(turns, prints);
+  let source: string;
+  let leafUuid: string | undefined;
+  if (match.kind === "rewind" && match.leafUuid) {
+    source = match.sessionId ?? sessionId;
+    leafUuid = match.leafUuid;
+  } else if (match.kind === "latest" && turns.at(-1)!.count === prints.length) {
+    source = sessionId;
+    leafUuid = getSessionLeafUuid(chatKey);
+  } else {
+    return null;
+  }
+  const file = findClaudeSessionFile(source);
+  if (!file) return null;
+  if (leafUuid && sessionChainAfterLeaf(file, leafUuid) !== "clean") return null;
+  return { sessionId: source, leafUuid, promptIndex, profile: chatTurnProfiles.get(chatKey) };
+}
+
 const UTILITY_SYSTEM_PROMPT =
   `You are a text generation helper running in ${currentHost().name} through the Claude Code harness. Follow the instructions in the user message and return only the requested output.`;
 
@@ -824,6 +880,7 @@ async function handleChatCompletions(
   // alive, it re-emits its call to the compacted chat together with the old
   // context size, and OpenCode compacts again, in a loop. Stop it first, so
   // its last events can't write the binding back either.
+  let summaryResume: SummaryResumePoint | null = null;
   if (metaKind === "summary") {
     const chatKey = sessionHeader || conversationKeyFromMessages(messages);
     const stopped = await stopConversationBridges(chatKey, "Chat compacted");
@@ -832,7 +889,15 @@ async function handleChatCompletions(
         conversationKey: chatKey,
       });
     }
+    summaryResume = summaryResumePoint(chatKey, messages);
+    log.info(
+      summaryResume
+        ? "[opencode-claude] summarizing from the chat's Claude session"
+        : "[opencode-claude] summarizing from the history text; the chat's Claude session can't be resumed at the summarized part",
+      { conversationKey: chatKey, cachedProfile: Boolean(summaryResume?.profile) },
+    );
     clearForeignSessionId(chatKey);
+    chatTurnProfiles.delete(chatKey);
   }
   const selection = selectionFromRequest(req, body);
   const model = resolveClaudeModelId(selection.modelId);
@@ -968,6 +1033,7 @@ async function handleChatCompletions(
       model,
       stream,
       toolResults,
+      summaryResume,
       releaseSpawnLock,
     });
   } finally {
@@ -1008,6 +1074,7 @@ async function startNewTurn(input: {
   model: string;
   stream: boolean;
   toolResults: Map<string, McpToolResultContent[]>;
+  summaryResume?: SummaryResumePoint | null;
   releaseSpawnLock: () => void;
 }): Promise<Response> {
   const {
@@ -1022,6 +1089,7 @@ async function startNewTurn(input: {
     stream,
     toolResults,
   } = input;
+  const summaryResume = input.summaryResume ?? null;
   // A new turn while an earlier one of this chat still runs (OpenCode
   // restarted, retried, or moved on): stop the old one first and wait for
   // its process to close. Two claude processes writing the same session
@@ -1050,10 +1118,16 @@ async function startNewTurn(input: {
 
   const env = buildClaudeCodeChildEnv();
 
-  const openCodeTools = orderedTools(
-    Array.isArray(body.tools) ? body.tools : [],
-  );
+  const requestTools = Array.isArray(body.tools) ? body.tools : [];
+  // A resumed summary repeats the tools of the chat turn it continues. Sorted
+  // either way: registration order is part of the cached prefix.
+  const openCodeTools = orderedTools(summaryResume?.profile?.tools ?? requestTools);
   const isMetaRequest = metaKind !== null;
+  // Claude Code adds the user's auto-memory index to every turn, even with
+  // no setting sources. In a utility turn it leaks into the output: a title
+  // came back naming an unrelated project from a memory line. A summary that
+  // resumes the chat's session keeps it, like the chat turn it continues.
+  if (isMetaRequest && !summaryResume) env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
   const requestDirectory = req.headers.get(DIRECTORY_HEADER)?.trim();
   const cwd =
     process.env.OPENCODE_CLAUDE_CWD || requestDirectory || process.cwd();
@@ -1114,7 +1188,9 @@ async function startNewTurn(input: {
   const prompt =
     answeredStep !== null
       ? answeredToolStepPrompt(messages, answeredStep)
-      : latestUserPrompt(messages);
+      : summaryResume
+        ? latestUserPrompt(messages.slice(0, summaryResume.promptIndex + 1))
+        : latestUserPrompt(messages);
   // History the prompt does not carry itself.
   const priorMessages =
     answeredStep !== null ? messages.slice(0, answeredStep) : priorMessagesOf(messages);
@@ -1202,7 +1278,7 @@ async function startNewTurn(input: {
     );
   }
 
-  let resume = getForeignSessionId(conversationKey);
+  let resume = summaryResume?.sessionId ?? getForeignSessionId(conversationKey);
   const sessionFile = resume ? findClaudeSessionFile(resume) : null;
   if (resume && !sessionFile) {
     // The claude CLI resumes by looking the session up on disk. A missing
@@ -1224,11 +1300,19 @@ async function startNewTurn(input: {
   // Where the resume has to be cut through a fork (see below): the session
   // to copy and the entry to cut at.
   let forkAt: { sessionId: string; leafUuid: string } | undefined;
+  // Turns after this chat's last Claude turn that the session never saw:
+  // the user switched to another model for them, or they failed before
+  // Claude ran. A resume alone would skip them.
+  let missedMessages: typeof priorMessages = [];
   if (resume && sessionFile && !isMetaRequest) {
     const match = matchTurnHistory(
       getSessionTurns(conversationKey),
       userHistoryFingerprints(priorMessages),
     );
+    // A rebuilt tool step continues Claude's own turn, which it saw.
+    if (match.kind === "latest" && answeredStep === null) {
+      missedMessages = historyAfterUserCount(priorMessages, match.count);
+    }
     // A boundary may sit in an earlier session of this chat (before a
     // fork); its file must still hold the leaf.
     const source = match.kind === "rewind" ? (match.sessionId ?? resume) : undefined;
@@ -1336,18 +1420,30 @@ async function startNewTurn(input: {
   // No resumable Claude session (first claude-code turn of this chat, model
   // switch mid-conversation, lost store): serialize the prior OpenCode
   // messages into the prompt so Claude sees the whole conversation.
-  const transcript = resume ? "" : buildConversationTranscript(priorMessages);
+  // A summary that can't resume gets the history sized to the chat model's
+  // window: OpenCode already fit the request to it.
+  // A resumed session gets only the turns it missed, if any.
+  const transcript = resume
+    ? buildConversationTranscript(missedMessages)
+    : metaKind === "summary"
+      ? buildConversationTranscript(priorMessages, summaryHistoryMaxChars(model))
+      : buildConversationTranscript(priorMessages);
   if (transcript) {
-    log.info("[opencode-claude] injecting transferred conversation history", {
-      conversationKey,
-      transcriptChars: transcript.length,
-      historyMessages: priorMessages.length,
-    });
+    log.info(
+      resume
+        ? "[opencode-claude] injecting turns the resumed Claude session missed"
+        : "[opencode-claude] injecting transferred conversation history",
+      {
+        conversationKey,
+        transcriptChars: transcript.length,
+        historyMessages: resume ? missedMessages.length : priorMessages.length,
+      },
+    );
   }
-  const contextualPrompt = withConversationContext(prompt, transcript);
+  const contextualPrompt = withConversationContext(prompt, transcript, Boolean(resume));
 
   const mcpServers =
-    !isMetaRequest && openCodeTools.length > 0
+    (!isMetaRequest || summaryResume) && openCodeTools.length > 0
       ? await buildOpenCodeMcpServer(openCodeTools, pendingTools, notifyPark)
       : undefined;
 
@@ -1375,7 +1471,7 @@ async function startNewTurn(input: {
   // never sees these calls.
   const localToolNames =
     bridgeOpenCodeTools && withOutputSlice(openCodeToolNames) ? [OUTPUT_SLICE_TOOL] : [];
-  const toolAliases = bridgeOpenCodeTools
+  const toolAliases = bridgeOpenCodeTools || (summaryResume && mcpServers)
     ? Object.fromEntries(
         openCodeToolNames.flatMap((name) => {
           const mcpName = mcpToolName(name);
@@ -1462,15 +1558,67 @@ async function startNewTurn(input: {
       ? [`# Project instructions (loaded by ${currentHost().name})\n\n${instructionFiles}`]
       : []),
   ].join("\n\n");
-  // Generation is an explicit model choice by the caller; keep it.
-  const queryModel =
-    metaKind === "title" || metaKind === "summary" ? META_REQUEST_MODEL : model;
-  handle = withGracefulStop(await queryStarter({
+  // The cache flags live in the stored profile too: a summary that resumes
+  // the chat repeats this prompt as-is and reads the chat from the cache.
+  const chatSystemPrompt: ClaudeSystemPrompt = {
+    type: "preset",
+    preset: "claude_code",
+    snapshot: true,
+    ...(excludeDynamicSections() ? { excludeDynamicSections: true } : {}),
+    append: systemAppend,
+  };
+  if (!isMetaRequest && sessionHeader) {
+    // Most recent last; long-idle chats fall off.
+    chatTurnProfiles.delete(conversationKey);
+    if (chatTurnProfiles.size >= MAX_CHAT_TURN_PROFILES) {
+      chatTurnProfiles.delete(chatTurnProfiles.keys().next().value!);
+    }
+    chatTurnProfiles.set(conversationKey, {
+      systemPrompt: chatSystemPrompt,
+      tools: openCodeTools,
+      effort: selection.effort,
+    });
+  }
+  // Titles run on haiku: they re-read the chat uncached and stay off the
+  // plan limits of the chat's model. A summary is written by the chat's own
+  // model, which knows the conversation best. Generation is an explicit model
+  // choice by the caller; keep it.
+  const queryModel = metaKind === "title" ? META_REQUEST_MODEL : model;
+  handle = withGracefulStop(await queryStarter(
+    summaryResume
+      ? {
+          // The summary continues an in-memory fork of the chat's Claude
+          // session, cut where OpenCode's summarized part ends. The request
+          // repeats the chat turn's system prompt, tools and thinking, so it
+          // reads the conversation from the prompt cache; nothing is written
+          // to the session or to disk.
+          prompt: queryPrompt,
+          cwd,
+          model: queryModel,
+          resume,
+          resumeSessionAt: summaryResume.leafUuid,
+          forkSession: true,
+          persistSession: false,
+          effort: summaryResume.profile?.effort ?? selection.effort,
+          env,
+          mcpServers,
+          autoCompactEnabled: false,
+          // A tool call is refused (dontAsk with nothing allowed), so one
+          // extra turn lets Claude write the summary after it.
+          maxTurns: 2,
+          isolateMcp: true,
+          tools: [],
+          toolAliases,
+          permissionMode: "dontAsk",
+          systemPrompt: summaryResume.profile?.systemPrompt ?? {
+            type: "preset",
+            preset: "claude_code",
+            append: buildRuntimeInstructions(),
+          },
+        }
+      : {
     prompt: queryPrompt,
     cwd,
-    // Titles and compaction summaries run as their own one-shot turn that
-    // re-reads the whole chat uncached; haiku keeps that off the plan limits
-    // of the model the user picked for the chat.
     model: queryModel,
     resume: isMetaRequest ? undefined : resume,
     effort: isMetaRequest ? undefined : selection.effort,
@@ -1501,15 +1649,7 @@ async function startNewTurn(input: {
     // Utility turns (titles, summaries, generate) need none of Claude Code's
     // coding instructions: a one-line prompt that names the host keeps them
     // ~15x smaller. Chat turns keep the Claude Code preset untouched.
-    systemPrompt: isMetaRequest
-      ? UTILITY_SYSTEM_PROMPT
-      : {
-          type: "preset",
-          preset: "claude_code",
-          snapshot: true,
-          ...(excludeDynamicSections() ? { excludeDynamicSections: true } : {}),
-          append: systemAppend,
-        },
+    systemPrompt: isMetaRequest ? UTILITY_SYSTEM_PROMPT : chatSystemPrompt,
   }));
 
   const accounting: TurnAccounting = {
@@ -1936,18 +2076,14 @@ export async function buildOpenCodeMcpServer(
         const annotations = PARALLEL_SAFE_TOOLS.has(name)
           ? { readOnlyHint: true as const }
           : undefined;
-        const defer = deferToolsEnabled() && DEFERRABLE_TOOLS.has(name);
-        const searchHint = description.split("\n")[0]?.slice(0, 200);
         listed.push({
           name,
           description,
           inputSchema: params,
           ...(annotations ? { annotations } : {}),
-          // What the SDK's own tools/list sends for alwaysLoad / searchHint;
-          // without alwaysLoad the CLI may defer the tool behind tool search.
-          _meta: defer
-            ? { "anthropic/searchHint": searchHint }
-            : { "anthropic/alwaysLoad": true },
+          // What the SDK's own tools/list sends for alwaysLoad; without it
+          // the CLI may defer the tool behind its tool search.
+          _meta: { "anthropic/alwaysLoad": true },
         });
         // Lossless zod for argument parsing; loose() keeps keys the schema
         // did not name instead of silently dropping them before OpenCode.
@@ -1990,11 +2126,7 @@ export async function buildOpenCodeMcpServer(
               content: result.length > 0 ? result : [{ type: "text", text: "" }],
             };
           },
-          {
-            alwaysLoad: !defer,
-            ...(defer ? { searchHint } : {}),
-            ...(annotations ? { annotations } : {}),
-          },
+          { alwaysLoad: true, ...(annotations ? { annotations } : {}) },
         );
       })
       .filter(Boolean);
@@ -2055,9 +2187,7 @@ export async function buildOpenCodeMcpServer(
 
     const server = createSdkMcpServer({
       name: currentHost().mcpServer,
-      // Server-level alwaysLoad ORs with per-tool flags, so deferral only
-      // works when the server itself does not force every tool in.
-      alwaysLoad: !deferToolsEnabled(),
+      alwaysLoad: true,
       tools: mcpTools,
     }) as { instance?: { server?: { setRequestHandler?: Function } } };
 
@@ -2793,14 +2923,6 @@ function presentToolBlocks(
   return { blocks: out, spilledChars, error };
 }
 
-/**
- * Tools measured as rare, and not required on the first turn of a coding
- * task. Everything else stays loaded, including tools we have not classified:
- * offloading an unknown tool the model needs immediately is a quality drop.
- * Only consulted when OPENCODE_CLAUDE_DEFER_TOOLS=1.
- */
-const DEFERRABLE_TOOLS = new Set(["webfetch", "websearch", "subagent"]);
-
 export function looksLikeToolError(text: string): boolean {
   const head = text.slice(0, 240);
   return (
@@ -2811,11 +2933,6 @@ export function looksLikeToolError(text: string): boolean {
   );
 }
 
-function envFlag(name: string): boolean {
-  const value = (process.env[name] ?? "").toLowerCase();
-  return value === "1" || value === "true" || value === "yes" || value === "on";
-}
-
 /**
  * Volatile Claude Code sections (cwd, memory path, git status) stay out of
  * the cached system prefix unless the operator opts back into the old layout.
@@ -2823,10 +2940,6 @@ function envFlag(name: string): boolean {
 function excludeDynamicSections(): boolean {
   const value = (process.env.OPENCODE_CLAUDE_DYNAMIC_SECTIONS ?? "").toLowerCase();
   return !(value === "keep" || value === "1" || value === "true");
-}
-
-function deferToolsEnabled(): boolean {
-  return envFlag("OPENCODE_CLAUDE_DEFER_TOOLS");
 }
 
 /**

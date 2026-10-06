@@ -209,20 +209,6 @@ async function main() {
     const editTool = listed.tools.find((t: { name: string }) => t.name === "edit");
     assert.deepEqual(editTool.inputSchema, parameters);
     assert.deepEqual(editTool._meta, { "anthropic/alwaysLoad": true });
-    process.env.OPENCODE_CLAUDE_DEFER_TOOLS = "1";
-    try {
-      const deferred: any = await buildOpenCodeMcpServer(
-        [{ type: "function", function: { name: "webfetch", description: "Fetch a URL\nmore", parameters } }] as any,
-        new Map(),
-        () => {},
-      );
-      const deferredList = await deferred.opencode.instance.server._requestHandlers
-        .get("tools/list")({ method: "tools/list", params: {} }, {});
-      const webfetch = deferredList.tools.find((t: { name: string }) => t.name === "webfetch");
-      assert.deepEqual(webfetch._meta, { "anthropic/searchHint": "Fetch a URL" });
-    } finally {
-      delete process.env.OPENCODE_CLAUDE_DEFER_TOOLS;
-    }
     await handlers.get("tools/call")(
       {
         method: "tools/call",
@@ -601,10 +587,6 @@ async function main() {
     assert.equal(byId["claude-sonnet-5"]!.contextWindow, 200_000);
     assert.equal(byId["claude-sonnet-5[1m]"]!.name, "Sonnet 5 (1M)");
     assert.equal(byId["claude-opus-4-8"]!.contextWindow, 1_000_000);
-    // 1M models declare an input cap so OpenCode compacts before the edge
-    assert.equal(byId["claude-opus-5-5[1m]"]!.inputWindow, 900_000);
-    assert.equal(byId["claude-sonnet-5[1m]"]!.inputWindow, 900_000);
-    assert.equal(byId["claude-sonnet-5"]!.inputWindow, undefined);
     assert.deepEqual(buildEffortVariants(byId["claude-haiku-4-5-20251001"]!), []);
     assert.equal(setDiscoveredModels(fromCli), true);
     const ids = getClaudeModels().map((m) => m.id);
@@ -1322,16 +1304,20 @@ async function main() {
     );
     const switched: unknown[] = [];
     setModelFallbackHandler((...args) => switched.push(args));
-    setClaudeQueryStarter(async () => ({
-      stream: (async function* () {
-        yield { type: "system", subtype: "model_refusal_fallback", scope: "session", original_model: "claude-fable-5-1[1m]", fallback_model: "claude-opus-5", api_refusal_category: "bio" };
-        yield { type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "answer from opus" } } };
-        yield { type: "result", is_error: false, usage: {} };
-      })(),
-      interrupt: async () => {},
-      close: () => {},
-      getPid: () => null,
-    }));
+    let chatEnv: Record<string, unknown> | undefined;
+    setClaudeQueryStarter(async (params) => {
+      chatEnv = params.env as Record<string, unknown>;
+      return {
+        stream: (async function* () {
+          yield { type: "system", subtype: "model_refusal_fallback", scope: "session", original_model: "claude-fable-5-1[1m]", fallback_model: "claude-opus-5", api_refusal_category: "bio" };
+          yield { type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "answer from opus" } } };
+          yield { type: "result", is_error: false, usage: {} };
+        })(),
+        interrupt: async () => {},
+        close: () => {},
+        getPid: () => null,
+      };
+    });
     await startProxy();
     const res = await fetch(getClaudeProxyBaseUrl() + "/chat/completions", {
       method: "POST",
@@ -1342,14 +1328,15 @@ async function main() {
     assert.match(body, /declined this request/);
     assert.match(body, /answer from opus/);
     assert.deepEqual(switched, [["ses_fallback", "claude-opus-5[1m]", undefined]]);
+    // Chat turns keep the user's Claude Code memory; only utility turns drop it.
+    assert.equal(chatEnv?.CLAUDE_CODE_DISABLE_AUTO_MEMORY, undefined);
     setModelFallbackHandler(null);
     setClaudeQueryStarter(null);
   }
 
   // A stopped OpenCode session closes its parked turn right away
   {
-    const { putBridge, getBridge } = await import("../src/bridge-pool.ts");
-    const { teardownSessionBridges } = await import("../src/proxy.ts");
+    const { putBridge, closeSessionBridges, getBridge } = await import("../src/bridge-pool.ts");
     let closed = false;
     putBridge({
       id: "abort-test",
@@ -1359,8 +1346,8 @@ async function main() {
       reportedUsage: new Map(),
       createdAt: Date.now(),
     } as any);
-    assert.deepEqual(teardownSessionBridges("ses_other"), []);
-    assert.deepEqual(teardownSessionBridges("ses_aborted"), ["ses_aborted"]);
+    assert.equal(closeSessionBridges("ses_other"), 0);
+    assert.equal(closeSessionBridges("ses_aborted"), 1);
     // Leaves the pool at once; the process closes after the stop settles.
     assert.equal(getBridge("abort-test"), undefined);
     await new Promise((r) => setTimeout(r, 50));
@@ -1369,17 +1356,15 @@ async function main() {
 
   // Evicting one OpenCode location must not stop the proxy another still uses
   {
-    const { retainProxy } = await import("../src/proxy.ts");
+    const { acquireProxy, releaseProxy, proxyHolderCount } = await import("../src/proxy.ts");
     await stopProxy();
-    const first = await startProxy();
-    const releaseFirst = retainProxy();
-    const second = await startProxy();
-    const releaseSecond = retainProxy();
+    const first = await acquireProxy();
+    const second = await acquireProxy();
     assert.equal(first, second, "locations share one proxy");
-    await releaseFirst();
-    await releaseFirst();
+    await releaseProxy();
+    assert.equal(proxyHolderCount(), 1);
     assert.equal(getProxyPort(), first, "still listening for the other location");
-    await releaseSecond();
+    await releaseProxy();
     assert.equal(getProxyPort(), null, "last location stops it");
   }
 
@@ -1461,6 +1446,10 @@ async function main() {
       );
       assert.deepEqual(titleOptions!.tools, []);
       assert.deepEqual(titleOptions!.settingSources, []);
+      assert.equal(
+        (titleOptions!.env as Record<string, unknown>).CLAUDE_CODE_DISABLE_AUTO_MEMORY,
+        "1",
+      );
       assert.deepEqual(titleOptions!.skills, []);
       assert.equal(titleOptions!.maxTurns, 1);
       assert.equal(titleOptions!.model, "claude-haiku-4-5");

@@ -39,12 +39,13 @@ import {
   type SdkModelRow,
 } from "./models.js";
 import { listClaudeSupportedModels } from "./query.js";
+import { closeSessionBridges } from "./bridge-pool.js";
 import {
   getClaudeProxyBaseUrl,
-  retainProxy,
+  acquireProxy,
+  releaseProxy,
   setModelFallbackHandler,
   startProxy,
-  teardownSessionBridges,
 } from "./proxy.js";
 
 export function applyClaudeRequestContextHeaders(
@@ -83,7 +84,11 @@ export function buildProviderModel(model: ClaudeModel, id: string): ModelInfo {
     enabled: true,
     limit: {
       context: model.contextWindow,
-      ...(model.inputWindow ? { input: model.inputWindow } : {}),
+      // OpenCode compacts at input - buffer when an input limit is set;
+      // without one a 1M window only compacts near its very edge.
+      ...(model.contextWindow >= 1_000_000
+        ? { input: Math.round(model.contextWindow * 0.9) }
+        : {}),
       output: model.maxTokens,
     },
   } as unknown as ModelInfo;
@@ -132,6 +137,41 @@ async function refreshModelCatalog(reload: () => Promise<void>) {
   }
 }
 
+/**
+ * Close a session's parked turn as soon as OpenCode stops the session. A turn
+ * parked on tool calls has no open HTTP request, so an abort never reaches the
+ * proxy otherwise and the claude process lingered until the TTL reaper.
+ */
+function watchSessionInterrupts(ctx: Plugin.Context): () => void {
+  const controller = new AbortController();
+  void (async () => {
+    try {
+      for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+        const e = event as { type?: string; data?: { sessionID?: string } };
+        if (
+          (e.type === "session.execution.interrupted" || e.type === "session.execution.failed") &&
+          e.data?.sessionID
+        ) {
+          const closed = closeSessionBridges(e.data.sessionID);
+          if (closed) {
+            log.info("[opencode-claude] closed the parked turn of a stopped session", {
+              sessionID: e.data.sessionID,
+            });
+          }
+        }
+      }
+    } catch (err) {
+      if (!controller.signal.aborted) {
+        log.warn(
+          "[opencode-claude] session event stream ended",
+          err instanceof Error ? err.message : err,
+        );
+      }
+    }
+  })();
+  return () => controller.abort();
+}
+
 /** Registration-time URL; model.request replaces it with the live one. */
 function currentProxyBaseUrl(): string {
   try {
@@ -161,7 +201,7 @@ export const ClaudeCodePlugin: Plugin.Plugin = {
     // Bind first (ephemeral port by default) so the provider points at the
     // live listener for this process.
     try {
-      await startProxy();
+      await acquireProxy();
     } catch (err) {
       log.error(
         "[opencode-claude] proxy failed to start",
@@ -217,9 +257,7 @@ export const ClaudeCodePlugin: Plugin.Plugin = {
       });
     });
 
-    const events = new AbortController();
-    void closeTurnsOnSessionStop(ctx.event, events.signal);
-
+    const stopWatching = watchSessionInterrupts(ctx);
     // Claude Code already moved the session to its fallback model; move the
     // OpenCode session too so the picker and the next turns match it.
     setModelFallbackHandler((sessionID, modelId, variant) => {
@@ -236,46 +274,12 @@ export const ClaudeCodePlugin: Plugin.Plugin = {
         );
     });
 
-    // The proxy is shared by every location in the process; unloading this
-    // one only stops it when no other location still holds it.
-    const releaseProxy = retainProxy();
     return async () => {
-      events.abort();
+      stopWatching();
       await releaseProxy();
     };
   },
 };
-
-/** Events after which a session's parked turn has nobody left to resume it. */
-const SESSION_STOP_EVENTS = new Set([
-  "session.execution.interrupted",
-  "session.execution.failed",
-  // Published when a run ends, including an aborted one.
-  "session.idle",
-]);
-
-/**
- * A turn parked on tool calls has no open HTTP request, so an abort never
- * reaches the proxy; close it as soon as OpenCode stops the session.
- */
-async function closeTurnsOnSessionStop(
-  events: Plugin.Context["event"],
-  signal: AbortSignal,
-): Promise<void> {
-  try {
-    for await (const event of events.subscribe({ signal })) {
-      const e = event as { type?: string; data?: { sessionID?: string } };
-      if (!e.type || !SESSION_STOP_EVENTS.has(e.type) || !e.data?.sessionID) continue;
-      teardownSessionBridges(e.data.sessionID);
-    }
-  } catch (err) {
-    if (signal.aborted) return;
-    log.warn(
-      "[opencode-claude] session event stream ended; aborted turns wait for the park TTL",
-      err instanceof Error ? err.message : err,
-    );
-  }
-}
 
 const INSTALL_METHOD_ID = "claude-cli-install";
 const SIGN_IN_METHOD_ID = "claude-cli";

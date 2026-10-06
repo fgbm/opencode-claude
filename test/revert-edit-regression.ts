@@ -60,8 +60,8 @@ async function main() {
       { count: 2, hash: "h2", leafUuid: "L2" },
     ];
     assert.deepEqual(matchTurnHistory([], ["h1"]), { kind: "untracked" });
-    assert.deepEqual(matchTurnHistory(turns, ["h1", "h2"]), { kind: "latest" });
-    assert.deepEqual(matchTurnHistory(turns, ["h1", "h2", "h3"]), { kind: "latest" });
+    assert.deepEqual(matchTurnHistory(turns, ["h1", "h2"]), { kind: "latest", count: 2 });
+    assert.deepEqual(matchTurnHistory(turns, ["h1", "h2", "h3"]), { kind: "latest", count: 2 });
     assert.deepEqual(matchTurnHistory(turns, ["h1"]), { kind: "rewind", index: 0, leafUuid: "L1" });
     assert.deepEqual(matchTurnHistory(turns, []), { kind: "diverged" });
     assert.deepEqual(matchTurnHistory(turns, ["hx", "h2x"]), { kind: "diverged" });

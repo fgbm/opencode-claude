@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.3.7 - 2026-10-05
+
+- **Fix: Claude missed what another model said in the same chat**: if you
+  switched a chat to another model for a few turns and then back to Claude,
+  Claude continued from its own last turn and never saw those turns. It
+  could answer an older question or do the wrong task. Now Claude gets the
+  turns it missed along with your new message.
+
+## 1.3.6 - 2026-10-05
+
+- **Fix: session titles named an unrelated project**: Claude Code adds your
+  saved memory notes to every request, including the one that names a new
+  session, so a title could pick up a project from those notes instead of
+  your message. Titles and text-only summaries now run without the notes.
+  Chat turns, and summaries that continue the chat's Claude session, keep
+  them.
+
+## 1.3.5 - 2026-10-05
+
+- **Compaction summaries cover the whole chat**: summaries used to be written
+  by Haiku from a text copy cut to 400k characters, with every tool result
+  cut to 1000, so on long chats they missed most of the conversation. Now
+  the chat's own model writes them from its Claude session, with full tool
+  results and most of it from the prompt cache. The session itself isn't
+  changed.
+- **Fix: Claude stopped working after a plugin reload**: when OpenCode
+  reloaded the plugin (a rebuild, a config change, an idle project closing)
+  while a command was running, Claude saw the call as rejected by the user
+  and stopped. The turn now waits for the result as usual. If a turn does
+  get cut off, Claude is told it was the plugin, not you.
+
 ## 1.3.4 - 2026-10-01
 
 - **Skills work again**: Claude gets OpenCode's skills list (from `.claude`,
