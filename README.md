@@ -137,7 +137,7 @@ Most people won't need these. Set them in the environment of the OpenCode server
 | `OPENCODE_CLAUDE_USAGE_LOG=0` | Stop writing `~/.local/share/opencode-claude/usage.jsonl`, one line per response with input / cache_read / cache_write / output tokens, a 5m/1h cache-write split, an estimated `turn_cost_usd`, and the sizes of the request sections that produced it |
 | `OPENCODE_CLAUDE_SPILL_CHARS` | Tool results longer than this are cut to a head and tail with a note on how much was dropped (default 8000, `0` turns it off). A `read` is never cut on the turn it runs |
 | `OPENCODE_CLAUDE_OUTPUT_STORE_MB` | Memory kept for cut outputs so Claude can read the rest through the local `output_slice` tool (default 16, `0` turns it off) |
-| `OPENCODE_CLAUDE_DYNAMIC_SECTIONS=keep` | Put cwd, memory path and git status back in the cached system prompt; by default they are moved out of the cached prefix |
+| `OPENCODE_CLAUDE_DYNAMIC_SECTIONS=keep` | Keep the working directory, memory path and git status in Claude Code's system prompt. By default they go in the first message instead, so every session shares the prompt and a new one reads it from the cache |
 
 ## Development
 

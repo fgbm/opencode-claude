@@ -403,6 +403,11 @@ function usageGrowth(a: OpenAIUsage, b: OpenAIUsage | null): OpenAIUsage | null 
  * message_delta arrives; the resumed response then sees that delta and
  * reports only the growth over the earlier snapshot, so nothing is counted
  * twice and the final output tokens are not lost.
+ *
+ * Output tokens add up over the calls of a response. Prompt tokens don't:
+ * OpenCode reads them as the size of the context, and compacts when they
+ * reach the model's input limit, so they are the last call's prompt (the
+ * context as it stands), not the sum of every call's prompt.
  */
 export class TurnUsageTracker {
   private readonly byId = new Map<
@@ -429,6 +434,19 @@ export class TurnUsageTracker {
   }
 
   total(): OpenAIUsage | null {
+    const sum = this.billed();
+    let last: OpenAIUsage | null = null;
+    for (const { max } of this.byId.values()) last = max;
+    if (!sum || !last) return sum;
+    return withPromptOf(sum, last);
+  }
+
+  /**
+   * Every call's growth added up, prompt side included: what the response
+   * was billed for. The usage journal prices this, not `total()`, whose
+   * prompt side is only the last call's.
+   */
+  billed(): OpenAIUsage | null {
     let sum = this.anonymous ? { ...this.anonymous } : null;
     for (const { baseline, max } of this.byId.values()) {
       const growth = usageGrowth(max, baseline);
@@ -532,6 +550,19 @@ export function estimateTurnCostUsd(
       (write1h + writeUnknown) * price.cacheWrite1h) /
     1_000_000;
   return Math.round(usd * 1e9) / 1e9;
+}
+
+/** `usage` with the prompt side (context size) taken from `call`. */
+function withPromptOf(usage: OpenAIUsage, call: OpenAIUsage): OpenAIUsage {
+  const { prompt_tokens_details: _dropped, ...rest } = usage;
+  return {
+    ...rest,
+    prompt_tokens: call.prompt_tokens,
+    total_tokens: call.prompt_tokens + usage.completion_tokens,
+    ...(call.prompt_tokens_details
+      ? { prompt_tokens_details: { ...call.prompt_tokens_details } }
+      : {}),
+  };
 }
 
 /** Count a replayed SDK assistant message only once across tool continuations. */

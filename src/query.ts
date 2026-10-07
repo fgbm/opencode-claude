@@ -286,7 +286,7 @@ export type StartClaudeQueryParams = {
         type: "preset";
         preset: "claude_code";
         append?: string;
-        /** Move cwd / memory / git status out of the cached system prefix. */
+        /** Move cwd, memory path and git status out of the system prompt. */
         excludeDynamicSections?: boolean;
       };
   canUseTool?: (
@@ -356,11 +356,7 @@ export async function startClaudeQuery(
     (await resolveClaudeCodeExecutable({ env })) ||
     undefined;
 
-  // Aborting runs the SDK transport's own SIGTERM → SIGKILL child cleanup,
-  // which still works when the stream is wedged and return() never settles.
-  const abortController = new AbortController();
   const options: Record<string, unknown> = {
-    abortController,
     cwd,
     env,
     includePartialMessages: params.includePartialMessages !== false,
@@ -459,11 +455,7 @@ export async function startClaudeQuery(
     }
     options.systemPrompt = systemPrompt;
   } else {
-    options.systemPrompt = {
-      type: "preset",
-      preset: "claude_code",
-      excludeDynamicSections: true,
-    };
+    options.systemPrompt = { type: "preset", preset: "claude_code" };
   }
 
   if (nonEmptyRecord(params.mcpServers)) options.mcpServers = params.mcpServers;
@@ -560,7 +552,6 @@ export async function startClaudeQuery(
         // ignore
       }
     }
-    abortController.abort();
   };
 
   return withGracefulStop({

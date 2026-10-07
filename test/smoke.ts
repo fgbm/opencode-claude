@@ -114,12 +114,18 @@ async function main() {
     tracker.add(start, "msg_1");
     tracker.add(final, "msg_1");
     tracker.add(start, "msg_1");
-    tracker.add(usageFromAnthropic({ input_tokens: 2, output_tokens: 50 })!, "msg_2");
+    tracker.add(usageFromAnthropic({ input_tokens: 2, cache_read_input_tokens: 1000, output_tokens: 50 })!, "msg_2");
     const total = tracker.total()!;
     assert.equal(total.completion_tokens, 241);
-    assert.equal(total.prompt_tokens, 810);
-    assert.equal(total.prompt_tokens_details?.cached_tokens, 800);
+    // Output adds up over the calls; the prompt is the last call's context.
+    assert.equal(total.prompt_tokens, 1002);
+    assert.equal(total.prompt_tokens_details?.cached_tokens, 1000);
     assert.equal(total.completion_tokens_details?.reasoning_tokens, 112);
+    // The usage journal prices every call's prompt, not only the last one.
+    const billed = tracker.billed()!;
+    assert.equal(billed.prompt_tokens, 808 + 1002);
+    assert.equal(billed.prompt_tokens_details?.cached_tokens, 1800);
+    assert.equal(billed.completion_tokens, 241);
     // A continuation response does not recount calls reported earlier
     const next = new TurnUsageTracker(seen);
     next.add(final, "msg_1");

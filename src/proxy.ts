@@ -17,7 +17,6 @@ import {
   deleteBridge,
   findBridgeByConversation,
   findBridgeByPendingTool,
-  getBridge,
   putBridge,
   stopBridge,
   stopConversationBridges,
@@ -669,6 +668,18 @@ type ClaudeSystemPrompt = {
   append?: string;
   excludeDynamicSections?: boolean;
 };
+
+/**
+ * Claude Code puts the working directory, memory path and git status into its
+ * system prompt, so no two sessions share it and every new session (each
+ * subagent too) writes the whole prompt to the cache again. Without them the
+ * prompt is the same everywhere and a new session reads it from the cache;
+ * Claude Code passes them in the first user message instead.
+ * OPENCODE_CLAUDE_DYNAMIC_SECTIONS=keep restores the old layout.
+ */
+function excludeDynamicSections(): boolean {
+  return (process.env.OPENCODE_CLAUDE_DYNAMIC_SECTIONS ?? "").trim().toLowerCase() !== "keep";
+}
 
 /** What a chat's last turn sent Claude, so its summary can hit the same cache. */
 type ChatTurnProfile = {
@@ -1557,8 +1568,8 @@ async function startNewTurn(input: {
       ? [`# Project instructions (loaded by ${currentHost().name})\n\n${instructionFiles}`]
       : []),
   ].join("\n\n");
-  // The cache flag lives in the stored profile too: a summary that resumes
-  // the chat repeats this prompt as-is and reads the chat from the cache.
+  // Stored in the chat's profile below, so a summary that resumes the chat
+  // repeats the same prompt, flag included, and still reads from the cache.
   const chatSystemPrompt: ClaudeSystemPrompt = {
     type: "preset",
     preset: "claude_code",
@@ -1611,6 +1622,9 @@ async function startNewTurn(input: {
           systemPrompt: summaryResume.profile?.systemPrompt ?? {
             type: "preset",
             preset: "claude_code",
+            // The chat's session was started without the dynamic sections in
+            // its system prompt; repeating them here would add them twice.
+            ...(excludeDynamicSections() ? { excludeDynamicSections: true } : {}),
             append: buildRuntimeInstructions(),
           },
         }
@@ -2292,7 +2306,7 @@ async function collectTurnResponse(
   recordUsage({
     conversationKey: bridge.conversationKey,
     model,
-    usage,
+    usage: resolveTurnUsage(usageTracker.billed(), resultUsage),
     toolCalls: toolCalls.length,
     sections: usageSections(
       bridge.accounting,
@@ -2795,7 +2809,7 @@ function streamOpenAIResponse(
       recordUsage({
         conversationKey: bridge.conversationKey,
         model,
-        usage,
+        usage: resolveTurnUsage(usageTracker.billed(), resultUsage),
         toolCalls: streamedToolCalls,
         sections: usageSections(
           bridge.accounting,
@@ -2929,15 +2943,6 @@ export function looksLikeToolError(text: string): boolean {
     // OpenCode 2: {"error":{"type":"tool.execution","message":...},"content":[]}
     /^\s*\{\s*"error"\s*:\s*\{\s*"type"\s*:\s*"tool\./.test(head)
   );
-}
-
-/**
- * Volatile Claude Code sections (cwd, memory path, git status) stay out of
- * the cached system prefix unless the operator opts back into the old layout.
- */
-function excludeDynamicSections(): boolean {
-  const value = (process.env.OPENCODE_CLAUDE_DYNAMIC_SECTIONS ?? "").toLowerCase();
-  return !(value === "keep" || value === "1" || value === "true");
 }
 
 /**
