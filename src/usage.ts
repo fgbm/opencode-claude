@@ -458,6 +458,39 @@ export class TurnUsageTracker {
     }
     return sum;
   }
+
+  /**
+   * The part of the query's `result` snapshot this response may claim. The
+   * snapshot is cumulative for the whole query, so a hop that saw no
+   * assistant event of its own (a limit hit mid-query) would otherwise
+   * report every earlier hop of the query again. Only what the snapshot
+   * holds beyond the calls already reported is new. Cost and the model
+   * breakdown pass through as metadata. On the `context` side the prompt is
+   * the newest call's context, as in {@link total}.
+   */
+  resultShare(
+    result: OpenAIUsage | null,
+    side: "billed" | "context",
+  ): OpenAIUsage | null {
+    if (!result) return null;
+    let seen: OpenAIUsage | null = null;
+    let last: OpenAIUsage | null = null;
+    for (const usage of this.reported.values()) {
+      seen = addOpenAIUsage(seen, usage);
+      last = usage;
+    }
+    let share = usageGrowth(result, seen) ?? {
+      prompt_tokens: 0,
+      completion_tokens: 0,
+      total_tokens: 0,
+    };
+    if (side === "context" && last) share = withPromptOf(share, last);
+    return {
+      ...share,
+      ...(result.cost_usd !== undefined ? { cost_usd: result.cost_usd } : {}),
+      ...(result.model_usage !== undefined ? { model_usage: result.model_usage } : {}),
+    };
+  }
 }
 
 /**
@@ -589,9 +622,10 @@ export function addUniqueAssistantUsage(
  *
  * The accumulated value is the correct per-response accounting; the result
  * snapshot is cumulative for the whole Claude query (all prior turns of a
- * resumed/continued session included) and would double-count. It is only a
- * fallback for turns where no assistant events were observed, plus a donor
- * for cost/model breakdown metadata.
+ * resumed/continued session included) and would double-count. Callers pass
+ * {@link TurnUsageTracker.resultShare} of it: a fallback for turns where no
+ * assistant events were observed, plus a donor for cost/model breakdown
+ * metadata.
  */
 export function resolveTurnUsage(
   accumulated: OpenAIUsage | null,

@@ -148,6 +148,33 @@ async function main() {
     const again = new TurnUsageTracker(reported);
     again.add(final, "msg_p");
     assert.equal(again.total(), null);
+
+    // A hop with no assistant event of its own (a limit hit mid-query) claims
+    // only what the query's cumulative result holds beyond reported calls.
+    const failed = new TurnUsageTracker(reported);
+    const cumulative = {
+      prompt_tokens: 808 + 3 + 500,
+      completion_tokens: 191 + 9 + 40,
+      total_tokens: 808 + 3 + 500 + 191 + 9 + 40,
+      prompt_tokens_details: { cached_tokens: 800 },
+      cost_usd: 1.5,
+    };
+    const billedShare = failed.resultShare(cumulative, "billed")!;
+    assert.equal(billedShare.prompt_tokens, 500);
+    assert.equal(billedShare.completion_tokens, 40);
+    assert.equal(billedShare.prompt_tokens_details, undefined);
+    assert.equal(billedShare.cost_usd, 1.5);
+    // OpenCode reads the prompt side as context size: the newest call's.
+    const contextShare = failed.resultShare(cumulative, "context")!;
+    assert.equal(contextShare.prompt_tokens, 3);
+    assert.equal(contextShare.completion_tokens, 40);
+    // Nothing beyond reported calls: no tokens, metadata only.
+    const covered = failed.resultShare({ prompt_tokens: 811, completion_tokens: 200, total_tokens: 1011 }, "billed")!;
+    assert.equal(covered.prompt_tokens, 0);
+    assert.equal(covered.completion_tokens, 0);
+    // The first hop of a query has nothing reported: the whole result is new.
+    const fresh = new TurnUsageTracker(new Map());
+    assert.equal(fresh.resultShare(cumulative, "billed")!.prompt_tokens, 1311);
   }
 
   // Utility turns carry OpenCode's instructions in the user message

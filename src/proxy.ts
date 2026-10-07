@@ -2331,11 +2331,17 @@ async function collectTurnResponse(
     }
   }
 
-  const usage = resolveTurnUsage(usageTracker.total(), resultUsage);
+  const usage = resolveTurnUsage(
+    usageTracker.total(),
+    usageTracker.resultShare(resultUsage, "context"),
+  );
   recordUsage({
     conversationKey: bridge.conversationKey,
     model,
-    usage: resolveTurnUsage(usageTracker.billed(), resultUsage),
+    usage: resolveTurnUsage(
+      usageTracker.billed(),
+      usageTracker.resultShare(resultUsage, "billed"),
+    ),
     toolCalls: toolCalls.length,
     sections: usageSections(
       bridge.accounting,
@@ -2834,11 +2840,17 @@ function streamOpenAIResponse(
           });
         }
       }
-      const usage = resolveTurnUsage(usageTracker.total(), resultUsage);
+      const usage = resolveTurnUsage(
+        usageTracker.total(),
+        usageTracker.resultShare(resultUsage, "context"),
+      );
       recordUsage({
         conversationKey: bridge.conversationKey,
         model,
-        usage: resolveTurnUsage(usageTracker.billed(), resultUsage),
+        usage: resolveTurnUsage(
+          usageTracker.billed(),
+          usageTracker.resultShare(resultUsage, "billed"),
+        ),
         toolCalls: streamedToolCalls,
         sections: usageSections(
           bridge.accounting,
