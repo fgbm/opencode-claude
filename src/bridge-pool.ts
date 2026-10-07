@@ -24,6 +24,14 @@ export type TurnAccounting = {
   userChars: number;
   toolsOffered: number;
   spilledChars: number;
+  /**
+   * Cut outputs and output_slice reads since the last usage line; the line
+   * that reports them resets them, so each line counts only its own hop.
+   */
+  spills: number;
+  outputSlices: number;
+  outputSliceMisses: number;
+  outputSliceChars: number;
   toolNames: string[];
   toolErrors: string[];
 };

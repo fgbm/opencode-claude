@@ -209,6 +209,10 @@ export type UsageSections = {
   tool_names?: string[];
   tool_errors?: string[];
   spilled_chars?: number;
+  spills?: number;
+  output_slices?: number;
+  output_slice_misses?: number;
+  output_slice_chars?: number;
   hop?: "query" | "continuation" | "replay";
 };
 

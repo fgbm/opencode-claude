@@ -107,6 +107,7 @@ import {
   outputStoreEnabled,
   sharedOutputStore,
   type OutputStore,
+  type SliceResult,
 } from "./output-store.js";
 import {
   detectMetaRequestKind,
@@ -296,12 +297,18 @@ function userPromptChars(prompt: string | SdkUserPrompt): number {
     .reduce((sum, block) => sum + block.text.length, 0);
 }
 
+/** Sections of one usage line. Takes (and resets) the per-hop counters. */
 function usageSections(
   accounting: TurnAccounting | undefined,
   hop: UsageSections["hop"],
   toolNames: string[],
 ): UsageSections | undefined {
   if (!accounting) return undefined;
+  const { spills, outputSlices, outputSliceMisses, outputSliceChars } = accounting;
+  accounting.spills = 0;
+  accounting.outputSlices = 0;
+  accounting.outputSliceMisses = 0;
+  accounting.outputSliceChars = 0;
   return {
     kind: accounting.kind,
     resumed: accounting.resumed,
@@ -316,6 +323,16 @@ function usageSections(
       : {}),
     ...(accounting.spilledChars > 0
       ? { spilled_chars: accounting.spilledChars }
+      : {}),
+    ...(spills > 0 ? { spills } : {}),
+    ...(outputSlices > 0
+      ? {
+          output_slices: outputSlices,
+          output_slice_chars: outputSliceChars,
+          ...(outputSliceMisses > 0
+            ? { output_slice_misses: outputSliceMisses }
+            : {}),
+        }
       : {}),
     hop,
   };
@@ -961,6 +978,7 @@ async function handleChatCompletions(
         );
         if (existing.accounting) {
           existing.accounting.spilledChars += presented.spilledChars;
+          existing.accounting.spills += presented.spills;
           if (presented.error) existing.accounting.toolErrors.push(tool.name);
         }
         tool.resolve(
@@ -1454,7 +1472,12 @@ async function startNewTurn(input: {
 
   const mcpServers =
     (!isMetaRequest || summaryResume) && openCodeTools.length > 0
-      ? await buildOpenCodeMcpServer(openCodeTools, pendingTools, notifyPark)
+      ? await buildOpenCodeMcpServer(openCodeTools, pendingTools, notifyPark, (result) => {
+          // Runs inside the turn, after `accounting` below is set.
+          accounting.outputSlices++;
+          if (result.ok) accounting.outputSliceChars += result.text.length;
+          else accounting.outputSliceMisses++;
+        })
       : undefined;
 
   const bridgeOpenCodeTools = !isMetaRequest && openCodeTools.length > 0;
@@ -1676,6 +1699,10 @@ async function startNewTurn(input: {
         : userPromptChars(contextualPrompt),
     toolsOffered: openCodeTools.length,
     spilledChars: 0,
+    spills: 0,
+    outputSlices: 0,
+    outputSliceMisses: 0,
+    outputSliceChars: 0,
     toolNames: [],
     toolErrors: [],
   };
@@ -2020,6 +2047,7 @@ export async function buildOpenCodeMcpServer(
   tools: OpenAITool[],
   pendingTools: Map<string, ParkedToolCall>,
   onPark: () => void,
+  onSlice?: (result: SliceResult) => void,
 ): Promise<Record<string, unknown> | undefined> {
   try {
     const sdk = await import("@anthropic-ai/claude-agent-sdk");
@@ -2175,6 +2203,7 @@ export async function buildOpenCodeMcpServer(
           sliceShape,
           async (args: { id: string; offset?: number; limit?: number }) => {
             const result = sharedOutputStore().slice(args.id, args.offset, args.limit);
+            onSlice?.(result);
             log.info("[opencode-claude] output_slice", {
               id: args.id,
               offset: args.offset ?? 0,
@@ -2920,9 +2949,11 @@ function presentToolBlocks(
 ): {
   blocks: McpToolResultContent[];
   spilledChars: number;
+  spills: number;
   error: boolean;
 } {
   let spilledChars = 0;
+  let spills = 0;
   // Error detection reads the original text, not a cut note.
   const first = blocks.find((b) => b.type === "text");
   const error = first?.type === "text" && looksLikeToolError(first.text);
@@ -2930,9 +2961,10 @@ function presentToolBlocks(
     if (block.type !== "text") return block;
     const presented = presentToolResult(name, block.text, store);
     spilledChars += presented.spilledChars;
+    if (presented.spilledChars > 0) spills++;
     return { type: "text" as const, text: presented.text };
   });
-  return { blocks: out, spilledChars, error };
+  return { blocks: out, spilledChars, spills, error };
 }
 
 export function looksLikeToolError(text: string): boolean {
