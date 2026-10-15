@@ -1,5 +1,53 @@
 # Changelog
 
+## 1.4.1 - 2026-10-13
+
+- **Opus 5.5's update before a tool call shows as text**: the short "found
+  X, now checking Y" note often landed in the Thinking panel. It now shows
+  as a message. Thanks to @JosueGalRe.
+- **Fix: compaction told Claude you had rejected its tool calls**: when
+  OpenCode compacted a chat mid-turn, the summary said the user rejected the
+  pending calls and interrupted, so Claude stopped and asked for permission
+  again. The summary now knows the plugin stopped the turn, and gets the
+  results OpenCode already has. Thanks to @sporez.
+- **Fix: parallel generate calls cancelled each other**: plugins running
+  several `generate.text` calls at once with the same instructions got
+  "ended the turn without any output" on all but one. Thanks to @sporez.
+- **Fewer "Model unavailable" errors on OpenCode v2 reloads**: the Claude
+  models are back in the catalog right away instead of after the CLI
+  check, and locations share one check. Thanks to @mradwankhalil.
+- **Works as root**: chats with tools no longer fail on a root-only VPS.
+  Thanks to @a-johanes.
+- **Haiku 5.5 has its full 1M window**: it was listed at 200K and compacted
+  early. Thanks to @aaa1124.
+
+## 1.4.0 - 2026-10-11
+
+- **Windows support**: on Windows with an npm-installed Claude Code, the
+  plugin handed the Agent SDK `claude.cmd`, which it can't start, so models
+  and chat failed with EINVAL. The plugin now uses the native `claude.exe`
+  npm installs beside it, and runs older installs that only have `cli.js`
+  through node. Thanks to @daveotero and @StephenHnilica.
+- **Fix: 1M chats compacted at 81%**: the plugin's 900k input limit stacked
+  with the 10% OpenCode keeps free since 2.0.19, so 1M chats compacted
+  around 810k. OpenCode's own reserve now gives the intended 90%. Thanks to
+  @android6.
+- **Sonnet 5.5 is listed before the CLI reports its models**: on a first
+  start or while signed out, a session on Sonnet 5.5 no longer asks you to
+  pick a model again. Thanks to @fgbm.
+- **Tool results in transferred history name their tool**: when Claude gets
+  the chat as text (a new session, turns another model answered), each
+  result says which tool it came from instead of an opaque call id. Thanks
+  to @fgbm.
+
+## 1.3.9 - 2026-10-11
+
+- **Fix: signing back in asked for a needless restart**: when Claude Code
+  lost its login, the error in chat said to run `claude auth login` and then
+  restart OpenCode. Each turn starts Claude Code again and reads the login
+  fresh, so the restart is not needed. The message now says to sign in from a
+  terminal and send the message again.
+
 ## 1.3.8 - 2026-10-07
 
 - **New sessions start from the prompt cache**: Claude Code's system prompt

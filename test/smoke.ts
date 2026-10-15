@@ -785,7 +785,8 @@ async function main() {
       { role: "tool", tool_call_id: "c1", content: "x".repeat(5000) },
     ]);
     assert.match(withTools, /\[called tool: bash\]/);
-    assert.match(withTools, /Tool result/);
+    // the result is labelled with the tool it answers, not the call id
+    assert.match(withTools, /Tool result \(bash\):/);
     assert.match(withTools, /x{5000}/);
     assert.doesNotMatch(withTools, /chars omitted/);
 
@@ -1266,9 +1267,9 @@ async function main() {
     assert.equal(info.settings.baseURL, "http://127.0.0.1:1/v1");
     const listed: any[] = buildClaudeProviderModels(getClaudeModels());
     const sonnetModel = listed.find((m) => m.id === "claude-sonnet-5");
-    // 1M models declare a 900k input limit so OpenCode compacts around 90%
+    // No input limit on 1M models: OpenCode keeps its own 10% free.
     const oneM = listed.find((m) => m.limit.context === 1_000_000);
-    assert.equal(oneM?.limit.input, 900_000);
+    assert.equal(oneM?.limit.input, undefined);
     assert.equal(sonnetModel.limit.input, undefined);
     assert.deepEqual(
       sonnetModel.variants.map((v: any) => v.id),
@@ -1276,11 +1277,6 @@ async function main() {
     );
     assert.deepEqual(sonnetModel.capabilities.input, ["text", "image", "pdf"]);
     assert.deepEqual(sonnetModel.limit, { context: 200_000, output: 64_000 });
-    assert.deepEqual(listed.find((m) => m.id === "claude-opus-5-5[1m]").limit, {
-      context: 1_000_000,
-      input: 900_000,
-      output: 128_000,
-    });
   }
 
   // Auth methods mirror CLI presence: install only when missing, relay only

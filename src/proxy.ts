@@ -95,6 +95,7 @@ import {
   userHistoryFingerprints,
   withConversationContext,
   withLeadingText,
+  withStoppedTurnNote,
   buildRuntimeInstructions,
   withSteering,
   type McpToolResultContent,
@@ -716,6 +717,11 @@ type SummaryResumePoint = {
   /** Index of OpenCode's summary prompt in the request. */
   promptIndex: number;
   profile?: ChatTurnProfile;
+  /**
+   * The plugin stopped the chat's parked turn for this compaction and the
+   * summary resumes after it, where the CLI recorded the stop as the user's.
+   */
+  afterStoppedTurn?: boolean;
 };
 
 /**
@@ -741,6 +747,7 @@ const SUMMARY_NUDGE_MARKER = "did not fill in the required summary template";
 function summaryResumePoint(
   chatKey: string,
   messages: OpenAIMessage[],
+  stoppedTurn: boolean,
 ): SummaryResumePoint | null {
   const sessionId = getForeignSessionId(chatKey);
   if (!sessionId) return null;
@@ -770,7 +777,13 @@ function summaryResumePoint(
   const file = findClaudeSessionFile(source);
   if (!file) return null;
   if (leafUuid && sessionChainAfterLeaf(file, leafUuid) !== "clean") return null;
-  return { sessionId: source, leafUuid, promptIndex, profile: chatTurnProfiles.get(chatKey) };
+  return {
+    sessionId: source,
+    leafUuid,
+    promptIndex,
+    profile: chatTurnProfiles.get(chatKey),
+    ...(stoppedTurn && match.kind === "latest" ? { afterStoppedTurn: true } : {}),
+  };
 }
 
 const UTILITY_SYSTEM_PROMPT =
@@ -897,9 +910,12 @@ async function handleChatCompletions(
     sessionHeader,
     messages,
   );
+  // A title or generate call without a session belongs to no chat: keyed
+  // by its prompt, concurrent calls sharing a preamble stopped each other.
+  const standalone = !sessionHeader && (metaKind === "title" || metaKind === "generate");
   const conversationKey =
     requestKeyNamespace(metaKind) +
-    (sessionHeader || conversationKeyFromMessages(messages));
+    (sessionHeader || (standalone ? `req_${randomUUID()}` : conversationKeyFromMessages(messages)));
   // OpenCode is compacting this chat. The Claude session it would resume
   // still holds the full uncompacted context, so drop the binding: the next
   // turn starts a fresh Claude session from the compacted history instead.
@@ -916,7 +932,7 @@ async function handleChatCompletions(
         conversationKey: chatKey,
       });
     }
-    summaryResume = summaryResumePoint(chatKey, messages);
+    summaryResume = summaryResumePoint(chatKey, messages, stopped > 0);
     log.info(
       summaryResume
         ? "[opencode-claude] summarizing from the chat's Claude session"
@@ -1216,6 +1232,11 @@ async function startNewTurn(input: {
   const prompt =
     answeredStep !== null
       ? answeredToolStepPrompt(messages, answeredStep)
+      : summaryResume?.afterStoppedTurn
+        ? withStoppedTurnNote(
+            latestUserPrompt(messages.slice(0, summaryResume.promptIndex + 1)),
+            messages.slice(0, summaryResume.promptIndex),
+          )
       : summaryResume
         ? latestUserPrompt(messages.slice(0, summaryResume.promptIndex + 1))
         : latestUserPrompt(messages);
@@ -1679,8 +1700,9 @@ async function startNewTurn(input: {
     allowedTools: bridgeOpenCodeTools
       ? [...openCodeToolNames, ...localToolNames].map((n) => mcpToolName(n))
       : undefined,
-    permissionMode: bridgeOpenCodeTools ? "bypassPermissions" : "dontAsk",
-    allowDangerouslySkipPermissions: bridgeOpenCodeTools,
+    // dontAsk runs exactly the allowed tools and refuses the rest. Not
+    // bypassPermissions: the CLI refuses to start with it as root.
+    permissionMode: "dontAsk",
     // Utility turns (titles, summaries, generate) need none of Claude Code's
     // coding instructions: a one-line prompt that names the host keeps them
     // ~15x smaller. Chat turns keep the Claude Code preset untouched.
@@ -3008,7 +3030,17 @@ type MapState = {
   shownNotices?: Set<string>;
   /** This response carried answer text or tool calls. */
   producedContent?: boolean;
+  /** A thinking block after the first, held until its signature arrives. */
+  heldThinking?: { index: number; text: string; narration: boolean };
 };
+
+/**
+ * Opus 5.5 sends its pre-tool-call update as a thinking block whose opaque
+ * signature is tagged "narration". If that tag ever changes it stays reasoning.
+ */
+function isNarrationSignature(signature: unknown): boolean {
+  return typeof signature === "string" && Buffer.from(signature, "base64").subarray(0, 64).includes("narration");
+}
 
 /**
  * The CLI hit a retryable API error and retries on its own (up to
@@ -3182,6 +3214,27 @@ function mapSdkEvent(event: unknown, state?: MapState): MappedEvent {
         ? { kind: "usage-delta", usage, messageId: state?.messageId ?? null }
         : { kind: "ignore" };
     }
+    // Real thinking is always block 0 and streams live; a later thinking block
+    // (the narration, sent in one burst) is held until its signature arrives.
+    const held = state && !e.parent_tool_use_id && state.heldThinking?.index === ev.index ? state.heldThinking : undefined;
+    if (
+      ev.type === "content_block_start" &&
+      state &&
+      !e.parent_tool_use_id &&
+      typeof ev.index === "number" &&
+      ev.index > 0 &&
+      (ev.content_block as { type?: unknown } | undefined)?.type === "thinking"
+    ) {
+      state.heldThinking = { index: ev.index, text: "", narration: false };
+      return { kind: "ignore" };
+    }
+    if (ev.type === "content_block_stop" && held && state) {
+      state.heldThinking = undefined;
+      if (!held.text) return { kind: "ignore" };
+      if (!held.narration) return { kind: "reasoning", text: held.text };
+      state.producedContent = true;
+      return { kind: "text", text: held.text };
+    }
     if (ev.type === "content_block_delta" && ev.delta && typeof ev.delta === "object") {
       const delta = ev.delta as Record<string, unknown>;
       if (delta.type === "text_delta" && typeof delta.text === "string") {
@@ -3192,10 +3245,15 @@ function mapSdkEvent(event: unknown, state?: MapState): MappedEvent {
         (delta.type === "thinking_delta" || delta.type === "reasoning_delta") &&
         typeof (delta.thinking ?? delta.text) === "string"
       ) {
-        return {
-          kind: "reasoning",
-          text: String(delta.thinking ?? delta.text),
-        };
+        const text = String(delta.thinking ?? delta.text);
+        if (held) {
+          held.text += text;
+          return { kind: "ignore" };
+        }
+        return { kind: "reasoning", text };
+      }
+      if (delta.type === "signature_delta" && held) {
+        held.narration = isNarrationSignature(delta.signature);
       }
     }
     return { kind: "ignore" };
